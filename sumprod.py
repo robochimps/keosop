@@ -115,6 +115,30 @@ class SumProd:
                 "A low-rank approximation is required (to be implemented)"
             )
 
+    def __array_ufunc__(self, ufunc, method, *args, **kwargs):
+        if method != "__call__" or kwargs.get("out") is not None:
+            return NotImplemented
+        if ufunc is np.sin:
+            return apply_unary_func(self, self.dummy_grids(), np.sin, "sin")
+        elif ufunc is np.cos:
+            return apply_unary_func(self, self.dummy_grids(), np.cos, "cos")
+        elif ufunc is np.tan:
+            return apply_unary_func(self, self.dummy_grids(), np.tan, "tan")
+        elif ufunc is np.sqrt:
+            return apply_unary_func(self, self.dummy_grids(), np.sqrt, "sqrt")
+        elif ufunc is np.exp:
+            return apply_unary_func(self, self.dummy_grids(), np.exp, "exp")
+        elif ufunc is np.log:
+            return apply_unary_func(self, self.dummy_grids(), np.log, "log")
+        elif ufunc is np.arccos:
+            return apply_unary_func(self, self.dummy_grids(), np.arccos, "arccos")
+        elif ufunc is np.arcsin:
+            return apply_unary_func(self, self.dummy_grids(), np.arcsin, "arcsin")
+        elif ufunc is np.arctan:
+            return apply_unary_func(self, self.dummy_grids(), np.arctan, "arctan")
+        else:
+            return NotImplemented
+
 
 def check_if_sumprod_unary(sop: SumProd):
     if sop.nterms != 1:
