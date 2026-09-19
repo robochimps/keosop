@@ -8,8 +8,8 @@ def internal_to_cartesian(q):
         [
             [0.0, 0.0, 0.0],
             [r1, 0.0, 0.0],
-            # [r2 * np.cos(theta), r2 * np.sin(theta), 0.0],
-            [r2 * theta, r2 * theta, 0.0],
+            [r2 * np.cos(theta), r2 * np.sin(theta), 0.0],
+            # [r2 * theta, r2 * theta, 0.0],
         ],
         dtype=object,
     )
@@ -27,4 +27,4 @@ if __name__ == "__main__":
 
     q = init_internal(grids)
     xyz = internal_to_cartesian(q)
-    print(xyz)
+    print(xyz[2, 0].terms)
