@@ -11,7 +11,7 @@ class SumProd:
         npoints = tuple(len(f) for f in self.terms[0])
         for t in self.terms:
             if len(t) != ncoo or tuple(len(f) for f in t) != npoints:
-                raise ValueError("Inconsistent shapes of terms in SOP")
+                raise ValueError("Inconsistent shapes of terms in SumProd")
 
     @property
     def npoints(self):
@@ -106,6 +106,15 @@ class SumProd:
                 self, self.dummy_grids(), lambda term: term**p, "pow"
             )
 
+    def __truediv__(self, x):
+        if np.isscalar(x):
+            return self * (1.0 / float(x))
+        else:
+            raise TypeError(
+                "Division by sum-of-products has no closed expression."
+                "A low-rank approximation is required (to be implemented)"
+            )
+
 
 def check_if_sumprod_unary(sop: SumProd):
     if sop.nterms != 1:
@@ -129,7 +138,7 @@ def apply_unary_func(sop: SumProd, grids, func, func_name):
     if kind in ("sum_of_more_than_one_term", "depends_on_more_than_one_coo"):
         raise RuntimeError(
             f"{func_name} of a multidimensional sum-of-product has no closed expression."
-            f"A low-rank nonlinear approximation is required (need to be implemented)"
+            f"A low-rank nonlinear approximation is required (to be implemented)"
         )
     elif kind == "constant":
         return SumProd.constant(float(func(terms[0])), grids)
