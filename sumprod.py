@@ -1,5 +1,7 @@
 import numpy as np
 
+# TODO: need to add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
+
 
 class SumProd:
 
