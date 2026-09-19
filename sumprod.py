@@ -102,7 +102,39 @@ class SumProd:
                 sop = sop * self
             return sop
         else:
-            return NotImplemented  # can actually implement if function depends only on one coordinate
+            sop = apply_unary_func(
+                self, self.dummy_grids(), lambda term: term**p, "pow"
+            )
+
+
+def check_if_sumprod_unary(sop: SumProd):
+    if sop.nterms != 1:
+        return ("sum_of_more_than_one_term", None, None)
+    else:
+        terms = sop.terms[0]
+        varying_coo = [icoo for icoo, f in enumerate(terms) if not np.allclose(f, f[0])]
+        if len(varying_coo) == 0:
+            scaling = np.prod([f[0] for f in terms])
+            return ("constant", None, np.array([scaling]))
+        elif len(varying_coo) == 1:
+            icoo = varying_coo[0]
+            scaling = np.prod([f[0] for jcoo, f in enumerate(terms) if jcoo != icoo])
+            return ("depends_on_one_coo", icoo, scaling * terms[icoo])
+        else:
+            return ("depends_on_more_than_one_coo", None, None)
+
+
+def apply_unary_func(sop: SumProd, grids, func, func_name):
+    kind, icoo, terms = check_if_sumprod_unary(sop)
+    if kind in ("sum_of_more_than_one_term", "depends_on_more_than_one_coo"):
+        raise RuntimeError(
+            f"{func_name} of a multidimensional sum-of-product has no closed expression."
+            f"A low-rank nonlinear approximation is required (need to be implemented)"
+        )
+    elif kind == "constant":
+        return SumProd.constant(float(func(terms[0])), grids)
+    else:
+        return SumProd.init_coordinate(icoo, grids, lambda _: func(terms))
 
 
 def init_internal(grids):
