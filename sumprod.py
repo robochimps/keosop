@@ -1,5 +1,8 @@
 import numpy as np
 
+# This is internal-to-Cartesian pass 'q->r' for building sum-of-product form,
+# where 'q' are internal coordinates and 'r' are Cartesian
+
 # TODO: need to add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
 
 
@@ -43,7 +46,7 @@ class SumProd:
     def dummy_grids(self):
         return [np.empty(n) for n in self.npoints]
 
-    def check_type(self, x):
+    def as_sumprod(self, x):
         if isinstance(x, SumProd):
             return x
         elif np.isscalar(x):
@@ -55,7 +58,7 @@ class SumProd:
         return SumProd(self.terms)
 
     def __add__(self, x):
-        x = self.check_type(x)
+        x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
         else:
@@ -68,14 +71,14 @@ class SumProd:
         return sop
 
     def __sub__(self, x):
-        x = self.check_type(x)
+        x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
         else:
             return self + (-x)
 
     def __rsub__(self, x):
-        x = self.check_type(x)
+        x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
         else:
