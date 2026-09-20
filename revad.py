@@ -19,40 +19,32 @@ class Expr:
         self.data = data
         self.id = id_next()
 
-    def as_expr(self, x):
-        if isinstance(x, Expr):
-            return x
-        elif np.isscalar(x):
-            return Expr("const", data=float(x))
-        else:
-            return NotImplemented
-
     def __add__(self, x):
-        return Expr("add", (self, self.as_expr(x)))
+        return Expr("add", (self, as_expr(x)))
 
     def __radd__(self, x):
-        return self.as_expr(x) + self
+        return as_expr(x) + self
 
     def __neg__(self):
         return Expr("neg", (self,))
 
     def __sub__(self, x):
-        return self + (-self.as_expr(x))
+        return self + (-as_expr(x))
 
     def __rsub__(self, x):
-        return self.as_expr(x) + (-self)
+        return as_expr(x) + (-self)
 
     def __mul__(self, x):
-        return Expr("mul", (self, self.as_expr(x)))
+        return Expr("mul", (self, as_expr(x)))
 
     def __rmul__(self, x):
-        return self.as_expr(x) * self
+        return as_expr(x) * self
 
     def __truediv__(self, x):
-        return Expr("div", (self, self.as_expr(x)))
+        return Expr("div", (self, as_expr(x)))
 
     def __rtruediv__(self, x):
-        return Expr("div", (self.as_expr(x), self))
+        return Expr("div", (as_expr(x), self))
 
     def __pow__(self, p):
         if not np.isscalar(p):
@@ -63,7 +55,7 @@ class Expr:
     def __array_ufunc__(self, ufunc, method, *args, **kwargs):
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
-        x = tuple(self.as_expr(inp) for inp in args)
+        x = tuple(as_expr(inp) for inp in args)
         ufunc_dict = {
             np.sin: "sin",
             np.cos: "cos",
@@ -81,13 +73,22 @@ class Expr:
             return NotImplemented
 
 
+def as_expr(x):
+    if isinstance(x, Expr):
+        return x
+    elif np.isscalar(x):
+        return Expr("const", data=float(x))
+    else:
+        return NotImplemented
+
+
 def init_cartesian(name):
     return Expr("coordinate", data=name)
 
 
 def trace(natoms, ncoo, cartesian_to_internal):
     r = np.array(
-        [[init_cartesian(f"r_{i}_{x}") for x in range(3)] for i in range(natoms)]
+        [[init_cartesian(f"{x}{i}") for x in ("x", "y", "z")] for i in range(natoms)]
     )
     q_expr = cartesian_to_internal(r)
     if len(q_expr) != ncoo:
@@ -135,3 +136,76 @@ def cross(x, y):
         ],
         dtype=object,
     )
+
+
+def topo_order(root):
+    seen = set()
+    order = []
+
+    def visit(node):
+        if node.id in seen:
+            return
+        else:
+            seen.add(node.id)
+            for arg in node.args:
+                visit(arg)
+            order.append(node)
+
+    visit(root)
+    return order
+
+
+def reverse_derivatives(root):
+    order = topo_order(root)
+    adj = {root.id: as_expr(1.0)}
+
+    def add(node, grad):
+        adj[node.id] = adj[node.id] + grad if node.id in adj else grad
+
+    for node in reversed(order):
+        if node.id not in adj:
+            continue
+        args = node.args
+        grad = adj[node.id]
+        if node.oper in ("coordinate", "const"):
+            pass
+        elif node.oper == "add":
+            add(args[0], grad)
+            add(args[1], grad)
+        elif node.oper == "neg":
+            add(args[0], -grad)
+        elif node.oper == "mul":
+            add(args[0], grad * args[1])
+            add(args[1], grad * args[0])
+        elif node.oper == "div":
+            add(args[0], grad / args[1])
+            add(args[1], -grad * args[0] / (args[1] * args[1]))
+        elif node.oper == "pow":
+            p = node.data
+            add(args[0], grad * p * (args[0] ** (p - 1)))
+        elif node.oper == "sqrt":
+            add(args[0], grad / (2 * node))
+        elif node.op == "sin":
+            add(args[0], grad * np.cos(args[0]))
+        elif node.op == "cos":
+            add(args[0], -grad * np.sin(args[0]))
+        elif node.op == "tan":
+            add(args[0], grad / (np.cos(args[0]) * np.cos(args[0])))
+        elif node.op == "exp":
+            add(args[0], grad * node)
+        elif node.op == "log":
+            add(args[0], grad / args[0])
+        elif node.op == "acos":
+            add(args[0], -grad / np.sin(node))
+        elif node.op == "asin":
+            add(args[0], grad / np.cos(node))
+        elif node.op == "atan":
+            add(args[0], grad * np.cos(node) * np.cos(node))
+        else:
+            return NotImplemented
+
+    return {
+        node.data: adj.get(node.id, as_expr(0.0))
+        for node in order
+        if node.oper == "coordinate"
+    }

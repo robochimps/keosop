@@ -1,6 +1,6 @@
 import numpy as np
 from sumprod import init_internal
-from revad import trace, norm, dot
+from revad import trace, norm, dot, reverse_derivatives
 
 
 def internal_to_cartesian(q):
@@ -43,3 +43,6 @@ if __name__ == "__main__":
 
     expr = trace(3, 3, cartesian_to_internal)
     print(expr[0].oper, expr[0].args, expr[0].data, expr[0].id)
+
+    deriv = reverse_derivatives(expr[0])
+    print(deriv)
