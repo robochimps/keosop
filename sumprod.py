@@ -153,7 +153,7 @@ def check_if_sumprod_unary(sop: SumProd):
         varying_coo = [icoo for icoo, f in enumerate(terms) if not np.allclose(f, f[0])]
         if len(varying_coo) == 0:
             scaling = np.prod([f[0] for f in terms])
-            return ("constant", None, np.array([scaling]))
+            return ("const", None, np.array([scaling]))
         elif len(varying_coo) == 1:
             icoo = varying_coo[0]
             scaling = np.prod([f[0] for jcoo, f in enumerate(terms) if jcoo != icoo])
@@ -169,7 +169,7 @@ def apply_unary_func(sop: SumProd, grids, func, func_name):
             f"{func_name} of a multidimensional sum-of-product has no closed expression."
             f"A low-rank nonlinear approximation is required (to be implemented)"
         )
-    elif kind == "constant":
+    elif kind == "const":
         return SumProd.constant(float(func(terms[0])), grids)
     else:
         return SumProd.init_coordinate(icoo, grids, lambda _: func(terms))

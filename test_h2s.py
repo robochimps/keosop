@@ -1,6 +1,7 @@
 import numpy as np
 from sumprod import init_internal
 from revad import trace, norm, dot, reverse_derivatives
+from gvib import Gvib
 
 
 def internal_to_cartesian(q):
@@ -37,12 +38,17 @@ if __name__ == "__main__":
         np.linspace(60 * np.pi / 180, 160 * np.pi / 180, 10),
     ]
 
-    q = init_internal(grids)
-    xyz = internal_to_cartesian(q)
-    print(xyz[2, 0].terms)
+    # q = init_internal(grids)
+    # xyz = internal_to_cartesian(q)
+    # print(xyz[2, 0].terms)
 
-    expr = trace(3, 3, cartesian_to_internal)
-    print(expr[0].oper, expr[0].args, expr[0].data, expr[0].id)
+    # expr = trace(3, 3, cartesian_to_internal)
+    # print(expr[0].oper, expr[0].args, expr[0].data, expr[0].id)
 
-    deriv = reverse_derivatives(expr[0])
-    print(deriv)
+    # deriv = reverse_derivatives(expr[0])
+    # print(deriv)
+
+    gvib = Gvib(grids, masses, internal_to_cartesian, cartesian_to_internal)
+
+    xyz = gvib.cartesian_sumprod()
+    print(xyz[2, 1].terms)

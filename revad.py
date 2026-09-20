@@ -167,7 +167,7 @@ def reverse_derivatives(root):
             continue
         args = node.args
         grad = adj[node.id]
-        if node.oper in ("coordinate", "const"):
+        if node.oper in ("x_coo", "const"):
             pass
         elif node.oper == "add":
             add(args[0], grad)
@@ -207,5 +207,5 @@ def reverse_derivatives(root):
     return {
         node.data: adj.get(node.id, as_expr(0.0))
         for node in order
-        if node.oper == "coordinate"
+        if node.oper == "x_coo"
     }
