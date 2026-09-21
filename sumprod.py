@@ -6,6 +6,7 @@ import numpy as np
 # TODO: add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
 
 RECIPROCAL_TOL = 1e-9
+COMPRESS_THRESH = 100
 
 
 class SumProd:
@@ -65,11 +66,96 @@ class SumProd:
     def copy(self):
         return SumProd(self.terms)
 
+    @staticmethod
+    def factor_key(f, hash_tol=0.0):
+        """Hash key for a 1D sum-of-product factor"""
+        a = np.ascontiguousarray(f, dtype=float)
+
+        if hash_tol <= 0.0:
+            a = a.copy()
+            a[a == 0.0] = 0.0
+            return (a.shape, a.dtype.str, a.tobytes())
+
+        q = np.rint(a / hash_tol).astype(np.int64)
+
+        return (q.shape, q.dtype.str, q.tobytes())
+
+    @staticmethod
+    def factors_similar(f, g, tol):
+        if tol <= 0.0:
+            return np.array_equal(f, g)
+        return np.max(np.abs(np.asarray(f) - np.asarray(g))) <= tol
+
+    @staticmethod
+    def is_zero_factor(f, zero_tol=0.0):
+        if zero_tol == 0.0:
+            return np.all(f == 0.0)
+        return np.all(np.abs(f) <= zero_tol)
+
+    def compress_hashed(self, zero_tol=0.0, hash_tol=0.0, max_sweeps=None):
+        """Exactly combine sum-of-product terms using hash grouping
+
+        For each coordinate k, terms that are identical in every factor except k are grouped
+        and their k-th factors are added:
+
+            f1(q_k) P(q_{l!=k}) + f2(q_k) P(q_{l!=k}) -> [f1(q_k) + f2(q_k)] P(q_{l!=k})
+        """
+        terms = [[f.copy() for f in t] for t in self.terms]
+
+        # any product containing zero factor is a zero term
+        terms = [
+            t for t in terms if not any(self.is_zero_factor(f, zero_tol) for f in t)
+        ]
+        if not terms:
+            return SumProd.constant(0.0, self.dummy_grids())
+
+        sweep = 0
+        changed = True
+
+        while changed and (max_sweeps is None or sweep < max_sweeps):
+            changed = False
+            sweep += 1
+
+            for k in range(self.ncoo):
+                groups = {}
+                for term in terms:
+                    key = tuple(
+                        self.factor_key(term[j], hash_tol)
+                        for j in range(self.ncoo)
+                        if j != k
+                    )
+                    groups.setdefault(key, []).append(term)
+
+                new_terms = []
+                for group in groups.values():
+                    if len(group) == 1:
+                        new_terms.append(group[0])
+                        continue
+
+                    merged = [f.copy() for f in group[0]]
+                    merged[k] = np.add.reduce([t[k] for t in group])
+                    changed = True
+
+                    if not self.is_zero_factor(merged[k], zero_tol):
+                        new_terms.append(merged)
+
+                terms = new_terms
+                if not terms:
+                    return SumProd.constant(0.0, self.dummy_grids())
+
+        return SumProd(terms)
+
+    def compress(self, thresh=COMPRESS_THRESH, zero_tol=0.0):
+        """Run exact hashed compression when the number of terms grows large"""
+        if self.nterms >= thresh:
+            return self.compress_hashed(zero_tol=zero_tol)
+        return self
+
     def __add__(self, x):
         x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
-        return SumProd(self.terms + x.terms)
+        return SumProd(self.terms + x.terms).compress()
 
     __radd__ = __add__
 
@@ -101,14 +187,14 @@ class SumProd:
             return NotImplemented
         return SumProd(
             [[a * b for a, b in zip(t1, t2)] for t1 in self.terms for t2 in x.terms]
-        )
+        ).compress()
 
     __rmul__ = __mul__
 
     def __pow__(self, p):
         if isinstance(p, (int, np.integer)):
             if p == 0:
-                return SumProd.constant(1.0, self.dummy_grids)
+                return SumProd.constant(1.0, self.dummy_grids())
 
             if p > 0:
                 sop = SumProd.constant(1.0, self.dummy_grids())

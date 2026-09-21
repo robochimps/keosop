@@ -149,13 +149,22 @@ class Gvib:
 
     def build_gvib(self, svec):
         gvib = np.empty((self.ncoo, self.ncoo), dtype=object)
+
         for lam in range(self.ncoo):
             for mu in range(lam, self.ncoo):
-                z = SumProd.constant(0, self.grids)
+
+                g = SumProd.constant(0, self.grids)
+
                 for i, mass in enumerate(self.masses):
                     for ialpha in range(3):
-                        z = z + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
-                gvib[lam, mu] = gvib[mu, lam] = z
+
+                        g = g + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
+                        g = g.compress_hashed()
+
+                g = g.compress_hashed()
+
+                gvib[lam, mu] = gvib[mu, lam] = g
+
         return gvib
 
     def run(self):
