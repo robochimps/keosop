@@ -1,15 +1,23 @@
 import numpy as np
 
-# This is internal-to-Cartesian pass 'q->r' for building sum-of-product form,
+# Performs internal-to-Cartesian pass 'q->r' for building sum-of-product form,
 # where 'q' are internal coordinates and 'r' are Cartesian
 
-# TODO: need to add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
+# TODO: add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
+
+RECIPROCAL_TOL = 1e-9
 
 
 class SumProd:
 
     def __init__(self, terms):
         self.terms = [[np.copy(np.array(f, dtype=float)) for f in t] for t in terms]
+
+        if len(self.terms) == 0:
+            raise ValueError("SumProd must contain at least one term")
+
+        if len(self.terms[0]) == 0:
+            raise ValueError("SumProd terms must contain at least one coordinate")
 
         # check shapes
         ncoo = len(self.terms[0])
@@ -61,8 +69,9 @@ class SumProd:
         x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
-        else:
-            return SumProd(self.terms + x.terms)
+        return SumProd(self.terms + x.terms)
+
+    __radd__ = __add__
 
     def __neg__(self):
         sop = self.copy()
@@ -74,78 +83,104 @@ class SumProd:
         x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
-        else:
-            return self + (-x)
+        return self + (-x)
 
     def __rsub__(self, x):
         x = self.as_sumprod(x)
         if x is NotImplemented:
             return NotImplemented
-        else:
-            return x + (-self)
+        return x + (-self)
 
     def __mul__(self, x):
         if np.isscalar(x):
             sop = self.copy()
             for t in sop.terms:
                 t[0] *= float(x)
-                return sop
-        elif not isinstance(x, SumProd):
-            return NotImplemented
-        else:
-            sop = SumProd(
-                [[a * b for a, b in zip(t1, t2)] for t1 in self.terms for t2 in x.terms]
-            )
             return sop
+        if not isinstance(x, SumProd):
+            return NotImplemented
+        return SumProd(
+            [[a * b for a, b in zip(t1, t2)] for t1 in self.terms for t2 in x.terms]
+        )
 
     __rmul__ = __mul__
 
     def __pow__(self, p):
-        if isinstance(p, (int, np.integer)) and p >= 0:
-            sop = SumProd.constant(1.0, self.dummy_grids())
-            for _ in range(int(p)):
-                sop = sop * self
-            return sop
-        else:
-            sop = apply_unary_func(
-                self, self.dummy_grids(), lambda term: term**p, "pow"
+        if isinstance(p, (int, np.integer)):
+            if p == 0:
+                return SumProd.constant(1.0, self.dummy_grids)
+
+            if p > 0:
+                sop = SumProd.constant(1.0, self.dummy_grids())
+                for _ in range(int(p)):
+                    sop = sop * self
+                return sop
+
+            # negative integer power
+            return sop_reciprocal(self ** (-int(p)), tol=RECIPROCAL_TOL)
+
+        if np.isscalar(p):
+            return sop_ufunc(
+                self, self.dummy_grids(), lambda term: term**p, f"pow({p})"
             )
+
+        return NotImplemented
 
     def __truediv__(self, x):
         if np.isscalar(x):
+            if abs(x) <= RECIPROCAL_TOL:
+                raise ZeroDivisionError(
+                    f"Division by a value close to zero: {x}: |x| <= {RECIPROCAL_TOL}"
+                )
             return self * (1.0 / float(x))
-        else:
-            raise TypeError(
-                "Division by sum-of-products has no closed expression."
-                "A low-rank approximation is required (to be implemented)"
-            )
+
+        if isinstance(x, SumProd):
+            try:
+                return self * sop_reciprocal(x, tol=RECIPROCAL_TOL)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    "Division by a general sum-of-products requires a low-rank approximation."
+                ) from exc
+
+        return NotImplemented
+
+    def __rtruediv__(self, x):
+        if np.isscalar(x):
+            return sop_reciprocal(self, tol=RECIPROCAL_TOL) * x
+        return NotImplemented
 
     def __array_ufunc__(self, ufunc, method, *args, **kwargs):
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
         if ufunc is np.sin:
-            return apply_unary_func(self, self.dummy_grids(), np.sin, "sin")
+            return sop_ufunc(self, self.dummy_grids(), np.sin, "sin")
         elif ufunc is np.cos:
-            return apply_unary_func(self, self.dummy_grids(), np.cos, "cos")
+            return sop_ufunc(self, self.dummy_grids(), np.cos, "cos")
         elif ufunc is np.tan:
-            return apply_unary_func(self, self.dummy_grids(), np.tan, "tan")
+            return sop_ufunc(self, self.dummy_grids(), np.tan, "tan")
         elif ufunc is np.sqrt:
-            return apply_unary_func(self, self.dummy_grids(), np.sqrt, "sqrt")
+            return sop_ufunc(self, self.dummy_grids(), np.sqrt, "sqrt")
         elif ufunc is np.exp:
-            return apply_unary_func(self, self.dummy_grids(), np.exp, "exp")
+            return sop_ufunc(self, self.dummy_grids(), np.exp, "exp")
         elif ufunc is np.log:
-            return apply_unary_func(self, self.dummy_grids(), np.log, "log")
+            return sop_ufunc(self, self.dummy_grids(), np.log, "log")
         elif ufunc is np.arccos:
-            return apply_unary_func(self, self.dummy_grids(), np.arccos, "arccos")
+            return sop_ufunc(self, self.dummy_grids(), np.arccos, "arccos")
         elif ufunc is np.arcsin:
-            return apply_unary_func(self, self.dummy_grids(), np.arcsin, "arcsin")
+            return sop_ufunc(self, self.dummy_grids(), np.arcsin, "arcsin")
         elif ufunc is np.arctan:
-            return apply_unary_func(self, self.dummy_grids(), np.arctan, "arctan")
+            return sop_ufunc(self, self.dummy_grids(), np.arctan, "arctan")
         else:
             return NotImplemented
 
 
-def check_if_sumprod_unary(sop: SumProd):
+def init_internal(grids):
+    ncoo = len(grids)
+    sop = [SumProd.init_coordinate(icoo, grids) for icoo in range(ncoo)]
+    return sop
+
+
+def check_sop_unary(sop: SumProd):
     if sop.nterms != 1:
         return ("sum_of_more_than_one_term", None, None)
     else:
@@ -162,12 +197,11 @@ def check_if_sumprod_unary(sop: SumProd):
             return ("depends_on_more_than_one_coo", None, None)
 
 
-def apply_unary_func(sop: SumProd, grids, func, func_name):
-    kind, icoo, terms = check_if_sumprod_unary(sop)
+def sop_ufunc(sop: SumProd, grids, func, func_name):
+    kind, icoo, terms = check_sop_unary(sop)
     if kind in ("sum_of_more_than_one_term", "depends_on_more_than_one_coo"):
-        raise RuntimeError(
-            f"{func_name} of a multidimensional sum-of-product has no closed expression."
-            f"A low-rank nonlinear approximation is required (to be implemented)"
+        raise NotImplementedError(
+            f"{func_name} of a multi-term sum-of-products requires a low-rank approximation."
         )
     elif kind == "const":
         return SumProd.constant(float(func(terms[0])), grids)
@@ -175,7 +209,24 @@ def apply_unary_func(sop: SumProd, grids, func, func_name):
         return SumProd.init_coordinate(icoo, grids, lambda _: func(terms))
 
 
-def init_internal(grids):
-    ncoo = len(grids)
-    sop = [SumProd.init_coordinate(icoo, grids) for icoo in range(ncoo)]
-    return sop
+def sop_reciprocal(sop: SumProd, tol: float = 1e-9):
+    if sop.nterms != 1:
+        raise NotImplementedError(
+            "Reciprocal of a multi-term sum-of-products requires a low-rank approximation."
+        )
+
+    term = sop.terms[0]
+    fs = []
+
+    for f in term:
+        f = np.asarray(f)
+
+        mask = np.abs(f) <= tol
+        if np.any(mask):
+            raise ZeroDivisionError(
+                f"Division by a value close to zero: min(abs(f)) = {np.min(np.abs(f))} < tolerance {tol}"
+            )
+
+        fs.append(1.0 / f)
+
+    return SumProd([fs])

@@ -1,6 +1,6 @@
 import numpy as np
 
-# This is Cartesian-to-internal pass 'r->q' for building dq_k/dr_{ia} derivatives,
+# Performs Cartesian-to-internal pass 'r->q' for building dq_k/dr_{ia} derivatives,
 # where q_k (k=1..3N-6) are internal coordinates and r_{ia} are Cartesian (i=1..N, a=x,y,z)
 
 expr_id = 0
@@ -83,7 +83,7 @@ def as_expr(x):
 
 
 def init_cartesian(name):
-    return Expr("coordinate", data=name)
+    return Expr("x_coo", data=name)
 
 
 def trace(natoms, ncoo, cartesian_to_internal):
@@ -184,25 +184,26 @@ def reverse_derivatives(root):
             p = node.data
             add(args[0], grad * p * (args[0] ** (p - 1)))
         elif node.oper == "sqrt":
+            # node = sqrt(x), so d/dx sqrt(x) = 1/(2*node)
             add(args[0], grad / (2 * node))
-        elif node.op == "sin":
+        elif node.oper == "sin":
             add(args[0], grad * np.cos(args[0]))
-        elif node.op == "cos":
+        elif node.oper == "cos":
             add(args[0], -grad * np.sin(args[0]))
-        elif node.op == "tan":
+        elif node.oper == "tan":
             add(args[0], grad / (np.cos(args[0]) * np.cos(args[0])))
-        elif node.op == "exp":
+        elif node.oper == "exp":
             add(args[0], grad * node)
-        elif node.op == "log":
+        elif node.oper == "log":
             add(args[0], grad / args[0])
-        elif node.op == "acos":
+        elif node.oper == "arccos":
             add(args[0], -grad / np.sin(node))
-        elif node.op == "asin":
+        elif node.oper == "arcsin":
             add(args[0], grad / np.cos(node))
-        elif node.op == "atan":
+        elif node.oper == "arctan":
             add(args[0], grad * np.cos(node) * np.cos(node))
         else:
-            return NotImplemented
+            raise NotImplementedError(f"{node.oper}")
 
     return {
         node.data: adj.get(node.id, as_expr(0.0))

@@ -11,7 +11,6 @@ def internal_to_cartesian(q):
             [0.0, 0.0, 0.0],
             [r1, 0.0, 0.0],
             [r2 * np.cos(theta), r2 * np.sin(theta), 0.0],
-            # [r2 * theta, r2 * theta, 0.0],
         ],
         dtype=object,
     )
@@ -50,5 +49,7 @@ if __name__ == "__main__":
 
     gvib = Gvib(grids, masses, internal_to_cartesian, cartesian_to_internal)
 
-    xyz = gvib.cartesian_sumprod()
-    print(xyz[2, 1].terms)
+    g = gvib.run()
+    for i in range(3):
+        for j in range(3):
+            print(i, j, g[i, j].nterms)

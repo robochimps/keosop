@@ -1,24 +1,60 @@
 import numpy as np
 
-from revad import as_expr, init_cartesian, reverse_derivatives
-from sumprod import SumProd, init_internal
+from revad import Expr, as_expr, init_cartesian, reverse_derivatives
+from sumprod import SumProd, init_internal, sop_ufunc
 
 
-def eval_expr(root, xyz_sop, grids, qnode_to_q, cache=None):
+def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
     """Recursively evaluates derivative graph into sum-of-products"""
+    if cache is None:
+        cache = {}
+
+    if root.id in cache:
+        return cache[root.id]
+
+    if root.id in q_bindings:
+        cache[root.id] = q_bindings[root.id]
+        return cache[root.id]
+
     args = root.args
     oper = root.oper
-
-    eval = lambda x: eval_expr(x, xyz_sop, grids, qnode_to_q, cache)
+    eval = lambda node: eval_expr(node, x_bindings, grids, q_bindings, cache)
 
     if oper == "const":
         out = SumProd.constant(root.data, grids)
     elif oper == "x_coo":
-        out = env[root.data]
+        out = x_bindings[root.data]
     elif oper == "add":
         out = eval(args[0]) + eval(args[1])
+    elif oper == "neg":
+        out = -eval(args[0])
+    elif oper == "mul":
+        out = eval(args[0]) * eval(args[1])
+    elif oper == "div":
+        out = eval(args[0]) / eval(args[1])
+    elif oper == "pow":
+        p = root.data
+        out = eval(args[0]) ** p
+    elif oper == "sin":
+        out = sop_ufunc(eval(args[0]), grids, np.sin, "sin")
+    elif oper == "cos":
+        out = sop_ufunc(eval(args[0]), grids, np.cos, "cos")
+    elif oper == "tan":
+        out = sop_ufunc(eval(args[0]), grids, np.tan, "tan")
+    elif oper == "sqrt":
+        out = sop_ufunc(eval(args[0]), grids, np.sqrt, "sqrt")
+    elif oper == "exp":
+        out = sop_ufunc(eval(args[0]), grids, np.exp, "exp")
+    elif oper == "log":
+        out = sop_ufunc(eval(args[0]), grids, np.log, "log")
+    elif oper == "acos":
+        out = sop_ufunc(eval(args[0]), grids, np.arccos, "acos")
+    elif oper == "asin":
+        out = sop_ufunc(eval(args[0]), grids, np.arcsin, "asin")
+    elif oper == "atan":
+        out = sop_ufunc(eval(args[0]), grids, np.arctan, "atan")
     else:
-        raise NotImplemented(oper)
+        raise NotImplementedError(f"{oper}")
 
     cache[root.id] = out
     return out
@@ -33,7 +69,7 @@ class Gvib:
         self.ncoo = len(grids)
         self.natoms = len(masses)
 
-    def sumprod_cartesian(self):
+    def sumprod_x(self):
         q = init_internal(self.grids)
         x = np.asarray(self.internal_to_cartesian(q), dtype=object)
 
@@ -49,9 +85,10 @@ class Gvib:
                     val = SumProd.constant(x[i, ialpha], self.grids)
                     x[i, ialpha] = val
                 xyz[i, ialpha] = x[i, ialpha]
+
         return xyz
 
-    def trace_internal(self):
+    def trace_q(self):
         xyz = np.array(
             [
                 [init_cartesian(f"{alpha}{i}") for alpha in ("x", "y", "z")]
@@ -59,26 +96,31 @@ class Gvib:
             ]
         )
 
-        q_expr = self.cartesian_to_internal(xyz)
+        q_expr = np.asarray(self.cartesian_to_internal(xyz), dtype=object).ravel()
 
         if len(q_expr) != self.ncoo:
             raise ValueError(
-                f"'cartesian_to_internal' output size = {len(q_expr)} does not match 'ncoo' = {self.ncoo}"
+                f"'cartesian_to_internal' output size = {len(q_expr)} does not match 'len(grids)' = {self.ncoo}"
             )
 
-        return xyz, q_expr
+        for icoo, q in enumerate(q_expr):
+            if not isinstance(q, Expr):
+                raise TypeError(f"cartesian_to_internal output {icoo} is not an Expr")
 
-    def sumprod_derivatives(self, xyz):
-        _, q_expr = self.trace_internal()
+        return q_expr
+
+    def sumprod_dq_dx(self, xyz_sop):
+        # trace x->q
+        q_expr = self.trace_q()
 
         # sum-of-products for Cartesian coordinates
-        xyz_sop = {
-            f"{alpha}{i}": xyz[i, alpha]
+        xyz_bindings = {
+            f"{alpha}{i}": xyz_sop[i, ialpha]
             for i in range(self.natoms)
-            for alpha in ("x", "y", "z")
+            for ialpha, alpha in enumerate(("x", "y", "z"))
         }
 
-        qnode_to_q = {
+        q_bindings = {
             q_expr[icoo].id: SumProd.init_coordinate(icoo, self.grids)
             for icoo in range(self.ncoo)
         }
@@ -87,14 +129,37 @@ class Gvib:
 
         for icoo, root in enumerate(q_expr):
 
+            # graph for derivative dq_icoo / dx
             deriv = reverse_derivatives(root)
 
             for i in range(self.natoms):
                 for ialpha, alpha in enumerate(("x", "y", "z")):
 
+                    # evaluate graph: substitute Cartesian coordinates
+                    # and internal coordinates by sum-of-product expressions
+                    # defined in `xyz_bindings` and `q_bindings`, respectively
                     svec[icoo, i, ialpha] = eval_expr(
                         deriv.get(f"{alpha}{i}", as_expr(0)),
-                        xyz_sop,
+                        xyz_bindings,
                         self.grids,
-                        qnode_to_q,
+                        q_bindings,
                     )
+
+        return svec
+
+    def build_gvib(self, svec):
+        gvib = np.empty((self.ncoo, self.ncoo), dtype=object)
+        for lam in range(self.ncoo):
+            for mu in range(lam, self.ncoo):
+                z = SumProd.constant(0, self.grids)
+                for i, mass in enumerate(self.masses):
+                    for ialpha in range(3):
+                        z = z + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
+                gvib[lam, mu] = gvib[mu, lam] = z
+        return gvib
+
+    def run(self):
+        xyz = self.sumprod_x()
+        svec = self.sumprod_dq_dx(xyz)
+        gvib = self.build_gvib(svec)
+        return gvib
