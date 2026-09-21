@@ -6,7 +6,7 @@ import numpy as np
 # TODO: add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
 
 RECIPROCAL_TOL = 1e-9
-NTERMS_THRESH = 100
+COMPRESS_NTERMS_THRESH = 100
 
 
 class SumProd:
@@ -67,24 +67,12 @@ class SumProd:
         return SumProd(self.terms)
 
     @staticmethod
-    def factor_key(f, hash_tol=0.0):
+    def factor_key(f):
         """Hash key for a 1D sum-of-product factor"""
-        a = np.ascontiguousarray(f, dtype=float)
+        a = np.ascontiguousarray(f, dtype=float).copy()
 
-        if hash_tol <= 0.0:
-            a = a.copy()
-            a[a == 0.0] = 0.0
-            return (a.shape, a.dtype.str, a.tobytes())
-
-        q = np.rint(a / hash_tol).astype(np.int64)
-
-        return (q.shape, q.dtype.str, q.tobytes())
-
-    @staticmethod
-    def factors_similar(f, g, tol):
-        if tol <= 0.0:
-            return np.array_equal(f, g)
-        return np.max(np.abs(np.asarray(f) - np.asarray(g))) <= tol
+        a[a == 0.0] = 0.0
+        return (a.shape, a.dtype.str, a.tobytes())
 
     @staticmethod
     def is_zero_factor(f, zero_tol=0.0):
@@ -92,7 +80,22 @@ class SumProd:
             return np.all(f == 0.0)
         return np.all(np.abs(f) <= zero_tol)
 
-    def compress_hashed(self, zero_tol=0.0, hash_tol=0.0, max_sweeps=None):
+    @staticmethod
+    def factors_close(f1, f2, tol=0.0):
+        """Compare two 1D sum-of-product factors"""
+        f1 = np.asarray(f1)
+        f2 = np.asarray(f2)
+
+        if f1.shape != f2.shape:
+            return False
+
+        if tol <= 0.0:
+            return np.array_equal(f1, f2)
+
+        # return np.max(np.abs(f1 - f2)) <= tol
+        return np.all(np.abs(f1 - f2) <= tol)
+
+    def compress_hashed(self, zero_tol=0.0, max_sweeps=None):
         """Exactly combine sum-of-product terms using hash grouping
 
         For each coordinate k, terms that are identical in every factor except k are grouped
@@ -121,9 +124,7 @@ class SumProd:
                 for term in terms:
 
                     key = tuple(
-                        self.factor_key(term[j], hash_tol)
-                        for j in range(self.ncoo)
-                        if j != k
+                        self.factor_key(term[j]) for j in range(self.ncoo) if j != k
                     )
 
                     groups.setdefault(key, []).append(term)
@@ -148,30 +149,17 @@ class SumProd:
 
         return SumProd(terms)
 
-    @staticmethod
-    def factors_equal(f1, f2, tol=0.0):
-        """Compare two 1D sum-of-product factors"""
-        f1 = np.asarray(f1)
-        f2 = np.asarray(f2)
-
-        if f1.shape != f2.shape:
-            return False
-
-        if tol <= 0.0:
-            return np.array_equal(f1, f2)
-
-        return np.max(np.abs(f1 - f2)) <= tol
-
     @classmethod
-    def terms_equal(cls, term1, term2, k, tol=0.0):
+    def terms_equal_except_one(cls, term1, term2, k, tol=0.0):
         """Compare two sum-of-product terms in all coordinates except k"""
         return all(
-            cls.factors_equal(term1[j], term2[j], tol)
+            cls.factors_close(term1[j], term2[j], tol)
             for j in range(len(term1))
             if j != k
         )
 
     def compress_similar(self, tol=1e-10, zero_tol=0.0, max_sweeps=None):
+        """Approximately combine sum-of-product terms using O(N^2) grouping"""
         terms = [[f.copy() for f in t] for t in self.terms]
 
         # any product containing zero factor is a zero term
@@ -205,7 +193,7 @@ class SumProd:
                         if used[j]:
                             continue
 
-                        if self.terms_equal(terms[i], terms[j], k, tol):
+                        if self.terms_equal_except_one(terms[i], terms[j], k, tol):
                             merged[k] += terms[j][k]
                             used[j] = True
                             changed = True
@@ -220,22 +208,18 @@ class SumProd:
 
         return SumProd(terms)
 
-    # def compress(self, thresh=COMPRESS_THRESH, zero_tol=0.0):
-    #     """Run exact hashed compression when the number of terms grows large"""
-    #     if self.nterms >= thresh:
-    #         return self.compress_hashed(zero_tol=zero_tol)
-    #     return self
-
     def compress(
-        self, tol=0.0, zero_tol=0.0, max_sweeps=None, nterms_thresh=NTERMS_THRESH
+        self,
+        tol=0.0,
+        zero_tol=0.0,
+        max_sweeps=None,
+        nterms_thresh=COMPRESS_NTERMS_THRESH,
     ):
         if self.nterms < nterms_thresh:
             return self
 
         # fast exact compression
-        sop = self.compress_hashed(
-            zero_tol=zero_tol, hash_tol=0.0, max_sweeps=max_sweeps
-        )
+        sop = self.compress_hashed(zero_tol=zero_tol, max_sweeps=max_sweeps)
 
         # optional approximate compression
         if tol > 0.0:
@@ -365,7 +349,8 @@ def check_sop_unary(sop: SumProd):
         return ("sum_of_more_than_one_term", None, None)
     else:
         terms = sop.terms[0]
-        varying_coo = [icoo for icoo, f in enumerate(terms) if not np.allclose(f, f[0])]
+        # varying_coo = [icoo for icoo, f in enumerate(terms) if not np.allclose(f, f[0])]
+        varying_coo = [icoo for icoo, f in enumerate(terms) if not np.all(f == f[0])]
         if len(varying_coo) == 0:
             scaling = np.prod([f[0] for f in terms])
             return ("const", None, np.array([scaling]))

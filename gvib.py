@@ -61,13 +61,25 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
 
 
 class Gvib:
-    def __init__(self, grids, masses, internal_to_cartesian, cartesian_to_internal):
+    def __init__(
+        self,
+        grids,
+        masses,
+        internal_to_cartesian,
+        cartesian_to_internal,
+        compress_tol: float = 1e-10,
+        compress_zero_tol: float = 1e-12,
+        compress_nterms_thresh: int = 10,
+    ):
         self.grids = [np.asarray(elem, dtype=float) for elem in grids]
         self.masses = np.asarray(masses, dtype=float)
         self.internal_to_cartesian = internal_to_cartesian
         self.cartesian_to_internal = cartesian_to_internal
         self.ncoo = len(grids)
         self.natoms = len(masses)
+        self.compress_tol = compress_tol
+        self.compress_zero_tol = compress_zero_tol
+        self.compress_nterms_thresh = compress_nterms_thresh
 
     def sumprod_x(self):
         q = init_internal(self.grids)
@@ -159,9 +171,19 @@ class Gvib:
                     for ialpha in range(3):
 
                         g = g + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
-                        g = g.compress(nterms_thresh=1)
 
-                g = g.compress(nterms_thresh=1)
+                        if g.nterms > self.compress_nterms_thresh:
+                            g = g.compress(
+                                nterms_thresh=1,
+                                tol=self.compress_tol,
+                                zero_tol=self.compress_zero_tol,
+                            )
+
+                g = g.compress(
+                    nterms_thresh=1,
+                    tol=self.compress_tol,
+                    zero_tol=self.compress_zero_tol,
+                )
 
                 gvib[lam, mu] = gvib[mu, lam] = g
 
