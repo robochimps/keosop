@@ -6,7 +6,7 @@ import numpy as np
 # TODO: add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
 
 RECIPROCAL_TOL = 1e-9
-COMPRESS_THRESH = 100
+NTERMS_THRESH = 100
 
 
 class SumProd:
@@ -119,15 +119,18 @@ class SumProd:
             for k in range(self.ncoo):
                 groups = {}
                 for term in terms:
+
                     key = tuple(
                         self.factor_key(term[j], hash_tol)
                         for j in range(self.ncoo)
                         if j != k
                     )
+
                     groups.setdefault(key, []).append(term)
 
                 new_terms = []
                 for group in groups.values():
+
                     if len(group) == 1:
                         new_terms.append(group[0])
                         continue
@@ -145,11 +148,102 @@ class SumProd:
 
         return SumProd(terms)
 
-    def compress(self, thresh=COMPRESS_THRESH, zero_tol=0.0):
-        """Run exact hashed compression when the number of terms grows large"""
-        if self.nterms >= thresh:
-            return self.compress_hashed(zero_tol=zero_tol)
-        return self
+    @staticmethod
+    def factors_equal(f1, f2, tol=0.0):
+        """Compare two 1D sum-of-product factors"""
+        f1 = np.asarray(f1)
+        f2 = np.asarray(f2)
+
+        if f1.shape != f2.shape:
+            return False
+
+        if tol <= 0.0:
+            return np.array_equal(f1, f2)
+
+        return np.max(np.abs(f1 - f2)) <= tol
+
+    @classmethod
+    def terms_equal(cls, term1, term2, k, tol=0.0):
+        """Compare two sum-of-product terms in all coordinates except k"""
+        return all(
+            cls.factors_equal(term1[j], term2[j], tol)
+            for j in range(len(term1))
+            if j != k
+        )
+
+    def compress_similar(self, tol=1e-10, zero_tol=0.0, max_sweeps=None):
+        terms = [[f.copy() for f in t] for t in self.terms]
+
+        # any product containing zero factor is a zero term
+        terms = [
+            t for t in terms if not any(self.is_zero_factor(f, zero_tol) for f in t)
+        ]
+
+        if not terms:
+            return SumProd.constant(0.0, self.dummy_grids())
+
+        sweep = 0
+        changed = True
+
+        while changed and (max_sweeps is None or sweep < max_sweeps):
+            changed = False
+            sweep += 1
+
+            for k in range(self.ncoo):
+
+                used = np.zeros(len(terms), dtype=bool)
+                new_terms = []
+
+                for i in range(len(terms)):
+                    if used[i]:
+                        continue
+
+                    merged = [f.copy() for f in terms[i]]
+                    used[i] = True
+
+                    for j in range(i + 1, len(terms)):
+                        if used[j]:
+                            continue
+
+                        if self.terms_equal(terms[i], terms[j], k, tol):
+                            merged[k] += terms[j][k]
+                            used[j] = True
+                            changed = True
+
+                    if not self.is_zero_factor(merged[k], zero_tol):
+                        new_terms.append(merged)
+
+                terms = new_terms
+
+                if not terms:
+                    return SumProd.constant(0.0, self.dummy_grids())
+
+        return SumProd(terms)
+
+    # def compress(self, thresh=COMPRESS_THRESH, zero_tol=0.0):
+    #     """Run exact hashed compression when the number of terms grows large"""
+    #     if self.nterms >= thresh:
+    #         return self.compress_hashed(zero_tol=zero_tol)
+    #     return self
+
+    def compress(
+        self, tol=0.0, zero_tol=0.0, max_sweeps=None, nterms_thresh=NTERMS_THRESH
+    ):
+        if self.nterms < nterms_thresh:
+            return self
+
+        # fast exact compression
+        sop = self.compress_hashed(
+            zero_tol=zero_tol, hash_tol=0.0, max_sweeps=max_sweeps
+        )
+
+        # optional approximate compression
+        if tol > 0.0:
+            sop = sop.compress_similar(
+                tol=tol, zero_tol=zero_tol, max_sweeps=max_sweeps
+            )
+
+        return sop
 
     def __add__(self, x):
         x = self.as_sumprod(x)

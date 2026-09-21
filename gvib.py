@@ -159,9 +159,9 @@ class Gvib:
                     for ialpha in range(3):
 
                         g = g + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
-                        g = g.compress_hashed()
+                        g = g.compress(nterms_thresh=1)
 
-                g = g.compress_hashed()
+                g = g.compress(nterms_thresh=1)
 
                 gvib[lam, mu] = gvib[mu, lam] = g
 
