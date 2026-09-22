@@ -1,3 +1,5 @@
+from itertools import combinations
+
 import numpy as np
 
 # Performs internal-to-Cartesian pass 'q->r' for building sum-of-product form,
@@ -65,6 +67,122 @@ class SumProd:
 
     def copy(self):
         return SumProd(self.terms)
+
+    @staticmethod
+    def factor_is_constant(f, tol=0.0):
+        """Return True if a one-dimensional factor is constant on its grid"""
+        f = np.asarray(f, dtype=float)
+        if tol <= 0.0:
+            return np.all(f == f[0])
+        return np.all(np.abs(f - f[0]) <= tol)
+
+    @classmethod
+    def term_active_set(cls, term, tol=0.0):
+        """Coordinates on which a sum-of-products term is not a constant on its grid"""
+        return frozenset(
+            k for k, f in enumerate(term) if not cls.factor_is_constant(f, tol)
+        )
+
+    def nmode_project(self, max_order, ref_indices, zero_tol=0.0, compress=True):
+        """Return the exact truncated N-mode projection of sum-of-products
+
+        For every product P(q)=prod_k f_k(q_k), write
+
+            f_k(q_k) = c_k + d_k(q_k),  c_k=f_k(q_k^0),
+
+        where q_k^0 is selected by `ref_indices[k]`.
+        Expanding the product and retaining subsets containing at most `max_order`
+        d-factors gives the truncated N-mode expansion.
+        Therefore, every returned nonconstant term contains at most `max_order`
+        simultaneously coupled coordinates.
+        """
+        if max_order < 0:
+            raise ValueError(f"'max_order' = {max_order} must be non-negative")
+        max_order = min(max_order, self.ncoo)
+
+        ref_indices = tuple(int(i) for i in ref_indices)
+
+        if len(ref_indices) != self.ncoo:
+            raise ValueError(
+                f"'ref_indices' must have length {self.ncoo}, got {len(ref_indices)}"
+            )
+
+        for k, (i, n) in enumerate(zip(ref_indices, self.npoints)):
+            if i < 0 or i >= n:
+                raise IndexError(
+                    f"'ref_indices[{k}]={i}' is outside the grid range [0, {n})"
+                )
+
+        ones = [np.ones(n, dtype=float) for n in self.npoints]
+        new_terms = []
+
+        for term in self.terms:
+            c = np.array([term[k][ref_indices[k]] for k in range(self.ncoo)])
+            delta = [term[k] - c[k] for k in range(self.ncoo)]
+
+            # coordinates with identically zero delta are not active
+            variable = [
+                k
+                for k in range(self.ncoo)
+                if not self.is_zero_factor(delta[k], zero_tol)
+            ]
+
+            for order in range(min(max_order, len(variable)) + 1):
+                for active_tuple in combinations(variable, order):
+                    active = set(active_tuple)
+                    coeff = float(
+                        np.prod([c[k] for k in range(self.ncoo) if k not in active])
+                    )
+
+                    if abs(coeff) <= zero_tol:
+                        continue
+
+                    factors = [ones[k].copy() for k in range(self.ncoo)]
+                    for k in active:
+                        factors[k] = delta[k].copy()
+                    factors[0] *= coeff
+
+                    new_terms.append(factors)
+
+        if not new_terms:
+            return SumProd.constant(0.0, self.dummy_grids())
+
+        out = SumProd(new_terms)
+
+        return out.compress_hashed(zero_tol=zero_tol) if compress else out
+
+    def nmode_mul(self, x, max_order, ref_indices, zero_tol=0.0, compress=True):
+        """Multiply two sum-of-products and return their exact truncated N-mode product"""
+        if np.isscalar(x):
+            return self.nmode_project(max_order, ref_indices, zero_tol) * x
+
+        if not isinstance(x, SumProd):
+            return NotImplemented
+
+        if self.npoints != x.npoints:
+            raise ValueError("Cannot multiply SumProd objects with different grids")
+
+        a = self.nmode_project(max_order, ref_indices, zero_tol, compress=False)
+        b = x.nmode_project(max_order, ref_indices, zero_tol, compress=False)
+
+        a_data = [(t, self.term_active_set(t, zero_tol)) for t in a.terms]
+        b_data = [(t, self.term_active_set(t, zero_tol)) for t in b.terms]
+
+        terms = []
+
+        for ta, aa in a_data:
+            for tb, ab in b_data:
+                if len(aa | ab) > max_order:
+                    continue
+
+                terms.append([fa * fb for fa, fb in zip(ta, tb)])
+
+        if not terms:
+            return SumProd.constant(0.0, self.dummy_grids())
+
+        out = SumProd(terms)
+
+        return out.compress_hashed(zero_tol=zero_tol) if compress else out
 
     @staticmethod
     def factor_key(f):
