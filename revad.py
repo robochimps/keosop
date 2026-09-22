@@ -66,6 +66,7 @@ class Expr:
             np.arccos: "arccos",
             np.arcsin: "arcsin",
             np.arctan: "arctan",
+            np.arctan2: "arctan2",
         }
         if ufunc in ufunc_dict:
             return Expr(ufunc_dict[ufunc], x)
@@ -87,6 +88,7 @@ def init_cartesian(name):
 
 
 def trace(natoms, ncoo, cartesian_to_internal):
+    _geom_cache.clear()
     r = np.array(
         [[init_cartesian(f"{x}{i}") for x in ("x", "y", "z")] for i in range(natoms)]
     )
@@ -138,6 +140,138 @@ def cross(x, y):
     )
 
 
+# Geometry primitive cache.
+# It is cleared at the start of each trace so that repeated distances and angles
+# created while building one coordinate graph share the same Expr nodes.
+# This sharing is important because Gvib can then bind those nodes directly
+# to the corresponding one-dimensional internal grids.
+_geom_cache = {}
+
+
+def _geom_key(name, *pts):
+    return (name,) + tuple(p.id for p in pts)
+
+
+def _point_xyz(p):
+    p = np.asarray(p, dtype=object).ravel()
+    if len(p) != 3 or not all(isinstance(x, Expr) for x in p):
+        raise TypeError("geometry primitives require 3-vectors of Expr objects")
+    return p
+
+
+def distance(a, b):
+    """Distance |a-b| as an atomic geometry primitive"""
+    a, b = _point_xyz(a), _point_xyz(b)
+    # convention for the endpoint order for correct caching
+    if tuple(x.id for x in a) > tuple(x.id for x in b):
+        a, b = b, a
+    pts = tuple(a) + tuple(b)
+    key = _geom_key("distance", *pts)
+    if key not in _geom_cache:
+        _geom_cache[key] = Expr("distance", pts)
+    return _geom_cache[key]
+
+
+def angle(a, b, c):
+    """Angle a-b-c as an atomic geometry primitive"""
+    a, b, c = _point_xyz(a), _point_xyz(b), _point_xyz(c)
+    # convention for the out atoms for correct caching
+    if tuple(x.id for x in a) > tuple(x.id for x in c):
+        a, c = c, a
+    pts = tuple(a) + tuple(b) + tuple(c)
+    key = _geom_key("angle", *pts)
+    if key not in _geom_cache:
+        _geom_cache[key] = Expr("angle", pts)
+    return _geom_cache[key]
+
+
+def dihedral(a, b, c, d):
+    """Signed dihedral a-b-c-d as an atomic geometry primitive.
+    The derivative convention is the standard signed torsion about b-c.
+    """
+    a, b, c, d = map(_point_xyz, (a, b, c, d))
+    pts = tuple(a) + tuple(b) + tuple(c) + tuple(d)
+    key = _geom_key("dihedral", *pts)
+    if key not in _geom_cache:
+        _geom_cache[key] = Expr("dihedral", pts)
+    return _geom_cache[key]
+
+
+def _same_point(a, b):
+    """True when two traced 3-vectors represent the same Cartesian point."""
+    a, b = _point_xyz(a), _point_xyz(b)
+    return tuple(x.id for x in a) == tuple(x.id for x in b)
+
+
+def _off_axis_point(plane, p, q):
+    """Return the point of a 3-point plane that is not one of axis endpoints p, q"""
+    plane = tuple(_point_xyz(x) for x in plane)
+    p, q = _point_xyz(p), _point_xyz(q)
+    has_p = any(_same_point(x, p) for x in plane)
+    has_q = any(_same_point(x, q) for x in plane)
+    if not (has_p and has_q):
+        raise ValueError(
+            "signed_plane_angle requires the directed axis endpoints to belong to both planes"
+        )
+    off = [x for x in plane if not _same_point(x, p) and not _same_point(x, q)]
+    if len(off) != 1:
+        raise ValueError("each plane must contain exactly one point off the axis")
+    return off[0]
+
+
+def signed_plane_angle(plane1, plane2, axis):
+    """Signed angle between two planes about a directed common axis as an atomic geometry primitive.
+
+    The reverse AD rule uses the exact sum-of-product-friendly dihedral gradient
+    rather than expanding atan2/cross/norm.
+    """
+    if len(plane1) != 3 or len(plane2) != 3 or len(axis) != 2:
+        raise ValueError("expected plane1=(A,B,C), plane2=(D,E,F), axis=(P,Q)")
+    P, Q = map(_point_xyz, axis)
+    R1 = _off_axis_point(plane1, P, Q)
+    R2 = _off_axis_point(plane2, P, Q)
+    pts = tuple(R1) + tuple(P) + tuple(Q) + tuple(R2)
+    key = _geom_key("signed_plane_angle", *pts)
+    if key not in _geom_cache:
+        _geom_cache[key] = Expr("signed_plane_angle", pts)
+    return _geom_cache[key]
+
+
+def _vsub(a, b):
+    return np.array([a[i] - b[i] for i in range(3)], dtype=object)
+
+
+def _vscale(s, v):
+    return np.array([s * v[i] for i in range(3)], dtype=object)
+
+
+def _vadd(a, b):
+    return np.array([a[i] + b[i] for i in range(3)], dtype=object)
+
+
+def _add_vec(add, point, vec, grad):
+    for i in range(3):
+        add(point[i], grad * vec[i])
+
+
+def expr_signature(node):
+    """Structural signature used to recognize algebraically identical traced subexpressions"""
+    if not isinstance(node, Expr):
+        return ("literal", repr(node))
+
+    if node.oper == "const":
+        return ("const", float(node.data))
+
+    if node.oper == "x_coo":
+        return ("x_coo", node.data)
+
+    sigs = [expr_signature(a) for a in node.args]
+    if node.oper in ("add", "mul"):
+        sigs = sorted(sigs, key=repr)
+
+    return (node.oper, node.data, tuple(sigs))
+
+
 def topo_order(root):
     seen = set()
     order = []
@@ -184,14 +318,15 @@ def reverse_derivatives(root):
             p = node.data
             add(args[0], grad * p * (args[0] ** (p - 1)))
         elif node.oper == "sqrt":
-            # node = sqrt(x), so d/dx sqrt(x) = 1/(2*node)
+            # node = sqrt(x), so reuse the output d/dx sqrt(x) = 1/(2*node)
             add(args[0], grad / (2 * node))
         elif node.oper == "sin":
             add(args[0], grad * np.cos(args[0]))
         elif node.oper == "cos":
             add(args[0], -grad * np.sin(args[0]))
         elif node.oper == "tan":
-            add(args[0], grad / (np.cos(args[0]) * np.cos(args[0])))
+            # node = tan(x), so reuse the output: d tan(x)/dx = 1 + node^2.
+            add(args[0], grad * (1.0 + node * node))
         elif node.oper == "exp":
             add(args[0], grad * node)
         elif node.oper == "log":
@@ -201,7 +336,83 @@ def reverse_derivatives(root):
         elif node.oper == "arcsin":
             add(args[0], grad / np.cos(node))
         elif node.oper == "arctan":
-            add(args[0], grad * np.cos(node) * np.cos(node))
+            # node = arctan(x), so reuse the output d atan(x)/dx = cos(node)^2
+            c = np.cos(node)
+            add(args[0], grad * c * c)
+        elif node.oper == "arctan2":
+            y, x = args
+            denom = x * x + y * y
+            add(y, grad * x / denom)
+            add(x, -grad * y / denom)
+        elif node.oper == "distance":
+            A = np.array(args[0:3], dtype=object)
+            B = np.array(args[3:6], dtype=object)
+            u = _vsub(A, B)
+            # reuse the output |A-B|; if this distance is an internal coordinate,
+            # q_bindings turns 1/node into a 1D factor
+            gA = _vscale(1.0 / node, u)
+            _add_vec(add, A, gA, grad)
+            _add_vec(add, B, _vscale(-1.0, gA), grad)
+        elif node.oper == "angle":
+            A = np.array(args[0:3], dtype=object)
+            B = np.array(args[3:6], dtype=object)
+            C = np.array(args[6:9], dtype=object)
+            u = _vsub(A, B)
+            v = _vsub(C, B)
+            ru = distance(A, B)
+            rv = distance(C, B)
+            # reuse node, ru and rv; if these are internal coordinates,
+            # all denominators will be univariate
+            ct = np.cos(node)
+            st = np.sin(node)
+            gu = np.array(
+                [(ct * u[i] / ru - v[i] / rv) / (ru * st) for i in range(3)],
+                dtype=object,
+            )
+            gv = np.array(
+                [(ct * v[i] / rv - u[i] / ru) / (rv * st) for i in range(3)],
+                dtype=object,
+            )
+            _add_vec(add, A, gu, grad)
+            _add_vec(add, C, gv, grad)
+            _add_vec(add, B, _vscale(-1.0, _vadd(gu, gv)), grad)
+        elif node.oper in ("dihedral", "signed_plane_angle"):
+            A = np.array(args[0:3], dtype=object)
+            B = np.array(args[3:6], dtype=object)
+            C = np.array(args[6:9], dtype=object)
+            D = np.array(args[9:12], dtype=object)
+            b1 = _vsub(B, A)
+            b2 = _vsub(C, B)
+            b3 = _vsub(D, C)
+            n1 = cross(b1, b2)
+            n2 = cross(b2, b3)
+            r12 = norm(_vsub(A, B))
+            r23 = norm(_vsub(C, B))
+            # |n2| = |(C-B) x (D-B)|, so the norm can be expressed with
+            # the internal distance |D-B| and angle C-B-D
+            rBD = norm(_vsub(D, B))
+            u1 = _vsub(A, B)
+            v1 = _vsub(C, B)
+            th1 = np.arccos(dot(u1, v1) / (norm(u1) * norm(v1)))
+            u2 = _vsub(C, B)
+            v2 = _vsub(D, B)
+            th2 = np.arccos(dot(u2, v2) / (norm(u2) * norm(v2)))
+            # |n1|^2 = r12^2 r23^2 sin(th1)^2
+            # |n2|^2 = r23^2 rBD^2 sin(th2)^2
+            # sum-of-products-friendly way of writing the denominators
+            n1sq = (r12 * r12) * (r23 * r23) * np.sin(th1) * np.sin(th1)
+            n2sq = (r23 * r23) * (rBD * rBD) * np.sin(th2) * np.sin(th2)
+            # standard signed-dihedral endpoint gradients for b1=B-A, b2=C-B, b3=D-C
+            gA = _vscale(-r23 / n1sq, n1)
+            gD = _vscale(r23 / n2sq, n2)
+            c1 = dot(b1, b2) / (r23 * r23)
+            c2 = dot(b3, b2) / (r23 * r23)
+            gB = _vadd(_vscale(-(1.0 + c1), gA), _vscale(c2, gD))
+            gC = _vscale(-1.0, _vadd(_vadd(gA, gB), gD))
+            _add_vec(add, A, gA, grad)
+            _add_vec(add, B, gB, grad)
+            _add_vec(add, C, gC, grad)
+            _add_vec(add, D, gD, grad)
         else:
             raise NotImplementedError(f"{node.oper}")
 

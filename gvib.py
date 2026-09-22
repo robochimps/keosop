@@ -1,6 +1,13 @@
 import numpy as np
 
-from revad import Expr, as_expr, init_cartesian, reverse_derivatives
+from revad import (
+    Expr,
+    _geom_cache,
+    as_expr,
+    expr_signature,
+    init_cartesian,
+    reverse_derivatives,
+)
 from sumprod import SumProd, init_internal, sop_ufunc
 
 
@@ -12,9 +19,12 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
     if root.id in cache:
         return cache[root.id]
 
-    if root.id in q_bindings:
-        cache[root.id] = q_bindings[root.id]
-        return cache[root.id]
+    binding = q_bindings.get(root.id)
+    if binding is None:
+        binding = q_bindings.get(("sig", expr_signature(root)))
+    if binding is not None:
+        cache[root.id] = binding
+        return binding
 
     args = root.args
     oper = root.oper
@@ -47,11 +57,11 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
         out = sop_ufunc(eval(args[0]), grids, np.exp, "exp")
     elif oper == "log":
         out = sop_ufunc(eval(args[0]), grids, np.log, "log")
-    elif oper == "acos":
+    elif oper == "arccos":
         out = sop_ufunc(eval(args[0]), grids, np.arccos, "acos")
-    elif oper == "asin":
+    elif oper == "arcsin":
         out = sop_ufunc(eval(args[0]), grids, np.arcsin, "asin")
-    elif oper == "atan":
+    elif oper == "arctan":
         out = sop_ufunc(eval(args[0]), grids, np.arctan, "atan")
     else:
         raise NotImplementedError(f"{oper}")
@@ -101,6 +111,9 @@ class Gvib:
         return xyz
 
     def trace_q(self):
+        # clear geometry primitive cache
+        _geom_cache.clear()
+
         xyz = np.array(
             [
                 [init_cartesian(f"{alpha}{i}") for alpha in ("x", "y", "z")]
@@ -132,10 +145,11 @@ class Gvib:
             for ialpha, alpha in enumerate(("x", "y", "z"))
         }
 
-        q_bindings = {
-            q_expr[icoo].id: SumProd.init_coordinate(icoo, self.grids)
-            for icoo in range(self.ncoo)
-        }
+        q_bindings = {}
+        for icoo, qnode in enumerate(q_expr):
+            q_sop = SumProd.init_coordinate(icoo, self.grids)
+            q_bindings[qnode.id] = q_sop
+            q_bindings[("sig", expr_signature(qnode))] = q_sop
 
         svec = np.empty((self.ncoo, self.natoms, 3), dtype=object)
 
