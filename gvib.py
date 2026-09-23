@@ -80,6 +80,8 @@ class Gvib:
         compress_tol: float = 1e-10,
         compress_zero_tol: float = 1e-12,
         compress_nterms_thresh: int = 10,
+        nmode_order: int | None = None,
+        nmode_ref_indices: list | tuple | None = None,
     ):
         self.grids = [np.asarray(elem, dtype=float) for elem in grids]
         self.masses = np.asarray(masses, dtype=float)
@@ -90,6 +92,37 @@ class Gvib:
         self.compress_tol = compress_tol
         self.compress_zero_tol = compress_zero_tol
         self.compress_nterms_thresh = compress_nterms_thresh
+
+        # optional exact truncated N-mode projection of each G-matrix element
+        self.nmode_order = nmode_order
+
+        if self.nmode_order is not None:
+
+            if nmode_ref_indices is None:
+                raise ValueError(
+                    f"'nmode_ref_indices' must be specified for N-mode truncation"
+                )
+
+            if len(nmode_ref_indices) != self.ncoo:
+                raise ValueError(
+                    f"'nmode_ref_indices' must have length 'len(grids)' = {self.ncoo}, got {len(nmode_ref_indices)}"
+                )
+
+            if self.nmode_order < 0:
+                raise ValueError(
+                    f"'nmode_order' = {nmode_order} must be non-negative or None"
+                )
+
+            self.nmode_order = min(self.nmode_order, self.ncoo)
+            self.nmode_ref_indices = tuple(int(i) for i in nmode_ref_indices)
+
+            for k, (i, g) in enumerate(zip(self.nmode_ref_indices, self.grids)):
+                if i < 0 or i >= len(g):
+                    raise IndexError(
+                        f"'nmode_ref_indices[{k}]={i}' is outside the grid range [0, {len(g)})"
+                    )
+        else:
+            self.nmode_ref_indices = None
 
     def sumprod_x(self):
         q = init_internal(self.grids)
@@ -125,12 +158,13 @@ class Gvib:
 
         if len(q_expr) != self.ncoo:
             raise ValueError(
-                f"'cartesian_to_internal' output size = {len(q_expr)} does not match 'len(grids)' = {self.ncoo}"
+                f"'cartesian_to_internal' output size = {len(q_expr)} must have length 'len(grids)' = {self.ncoo}, "
+                f"got {len(q_expr)}"
             )
 
         for icoo, q in enumerate(q_expr):
             if not isinstance(q, Expr):
-                raise TypeError(f"cartesian_to_internal output {icoo} is not an Expr")
+                raise TypeError(f"'cartesian_to_internal' output {icoo} is not an Expr")
 
         return q_expr
 
@@ -184,7 +218,21 @@ class Gvib:
                 for i, mass in enumerate(self.masses):
                     for ialpha in range(3):
 
-                        g = g + svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
+                        if self.nmode_order is None:
+                            contrib = svec[lam, i, ialpha] * svec[mu, i, ialpha] / mass
+                        else:
+                            # exact truncated N-mode projection of the product
+                            contrib = (
+                                svec[lam, i, ialpha].nmode_mul(
+                                    svec[mu, i, ialpha],
+                                    self.nmode_order,
+                                    self.nmode_ref_indices,
+                                    zero_tol=self.compress_zero_tol,
+                                )
+                                / mass
+                            )
+
+                        g = g + contrib
 
                         if g.nterms > self.compress_nterms_thresh:
                             g = g.compress(
@@ -198,6 +246,14 @@ class Gvib:
                     tol=self.compress_tol,
                     zero_tol=self.compress_zero_tol,
                 )
+
+                # don't know if this is necessary, as we already do svec[].nmode_mul()
+                # if self.nmode_order is not None:
+                #     g = g.nmode_project(
+                #         self.nmode_order,
+                #         self.nmode_ref_indices,
+                #         zero_tol=self.compress_zero_tol,
+                #     )
 
                 gvib[lam, mu] = gvib[mu, lam] = g
 
