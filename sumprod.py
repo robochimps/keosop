@@ -3,7 +3,7 @@ from itertools import combinations
 import numpy as np
 
 # Performs internal-to-Cartesian pass 'q->r' for building sum-of-product form,
-# where 'q' are internal coordinates and 'r' are Cartesian
+# where 'q' are internal coordinates and 'r' are Cartesian coordinate
 
 # TODO: add forward-mode AD for consistency check between user's input internal-to-Cartesian and Cartesian-to-internal functions
 
@@ -78,7 +78,7 @@ class SumProd:
 
     @classmethod
     def term_active_set(cls, term, tol=0.0):
-        """Coordinates on which a sum-of-products term is not a constant on its grid"""
+        """Coordinates on which sum-of-products term is not a constant on its grid"""
         return frozenset(
             k for k, f in enumerate(term) if not cls.factor_is_constant(f, tol)
         )
@@ -216,8 +216,8 @@ class SumProd:
     def compress_hashed(self, zero_tol=0.0, max_sweeps=None):
         """Exactly combine sum-of-product terms using hash grouping
 
-        For each coordinate k, terms that are identical in every factor except k are grouped
-        and their k-th factors are added:
+        For each coordinate k, terms that are identical in every factor except k
+        are grouped and their k-th factors are added:
 
             f1(q_k) P(q_{l!=k}) + f2(q_k) P(q_{l!=k}) -> [f1(q_k) + f2(q_k)] P(q_{l!=k})
         """
@@ -434,7 +434,41 @@ class SumProd:
     def __array_ufunc__(self, ufunc, method, *args, **kwargs):
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
-        if ufunc is np.sin:
+
+        if ufunc is np.add:
+            a, b = args
+            if a is self:
+                return self.__add__(b)
+            else:
+                return self.__radd__(a)
+        elif ufunc is np.subtract:
+            a, b = args
+            if a is self:
+                return self.__sub__(b)
+            else:
+                return self.__rsub__(a)
+        elif ufunc is np.multiply:
+            a, b = args
+            if a is self:
+                return self.__mul__(b)
+            else:
+                return self.__rmul__(a)
+        elif ufunc is np.divide:
+            a, b = args
+            if a is self:
+                return self.__truediv__(b)
+            else:
+                return self.__rtruediv__(a)
+        elif ufunc is np.power:
+            a, b = args
+            if a is self:
+                return self.__pow__(b)
+            return NotImplemented
+        elif ufunc is np.negative:
+            return self.__neg__()
+        elif ufunc is np.positive:
+            return self
+        elif ufunc is np.sin:
             return sop_ufunc(self, self.dummy_grids(), np.sin, "sin")
         elif ufunc is np.cos:
             return sop_ufunc(self, self.dummy_grids(), np.cos, "cos")
