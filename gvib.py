@@ -81,7 +81,8 @@ class Gvib:
         cartesian_to_internal,
         frame_conditions=None,
         compress_tol: float = 1e-10,
-        compress_zero_tol: float = 1e-12,
+        compress_zero_tol: float = 1e-14,
+        compress_identity_tol: float = 1e-12,
         compress_nterms_thresh: int = 10,
         nmode_order: int | None = None,
         nmode_ref_indices: list | tuple | None = None,
@@ -96,6 +97,7 @@ class Gvib:
         self.natoms = len(masses)
         self.compress_tol = compress_tol
         self.compress_zero_tol = compress_zero_tol
+        self.compress_identity_tol = compress_identity_tol
         self.compress_nterms_thresh = compress_nterms_thresh
 
         # optional exact truncated N-mode projection of each G-matrix element
@@ -232,12 +234,14 @@ class Gvib:
                                 nterms_thresh=1,
                                 tol=self.compress_tol,
                                 zero_tol=self.compress_zero_tol,
+                                identity_tol=self.compress_identity_tol,
                             )
 
                 g = g.compress(
                     nterms_thresh=1,
                     tol=self.compress_tol,
                     zero_tol=self.compress_zero_tol,
+                    identity_tol=self.compress_identity_tol,
                 )
 
                 if self.nmode_order is not None:
@@ -245,11 +249,13 @@ class Gvib:
                         self.nmode_order,
                         self.nmode_ref_indices,
                         zero_tol=self.compress_zero_tol,
+                        identity_tol=self.compress_identity_tol,
                     )
                     g = g.compress(
                         nterms_thresh=1,
                         tol=self.compress_tol,
                         zero_tol=self.compress_zero_tol,
+                        identity_tol=self.compress_identity_tol,
                     )
                 gmat[lam, mu] = g
 
@@ -320,8 +326,15 @@ class Gvib:
         if tol is None:
             tol = self.compress_zero_tol
 
-        z = sop.compress_hashed(zero_tol=tol)
-        z = z.compress_similar(tol=self.compress_tol, zero_tol=tol)
+        z = sop.compress_hashed(
+            zero_tol=tol,
+            identity_tol=self.compress_identity_tol,
+        )
+        z = z.compress_similar(
+            tol=self.compress_tol,
+            zero_tol=tol,
+            identity_tol=self.compress_identity_tol,
+        )
 
         value = self.sop_constant_value(z, tol=tol)
 
@@ -348,7 +361,10 @@ class Gvib:
 
         det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
         det = det.compress(
-            nterms_thresh=1, tol=self.compress_tol, zero_tol=self.compress_zero_tol
+            nterms_thresh=1,
+            tol=self.compress_tol,
+            zero_tol=self.compress_zero_tol,
+            identity_tol=self.compress_identity_tol,
         )
 
         return det
@@ -726,7 +742,10 @@ class Gvib:
                 val = val + float(mass) * xyz_sop[i, alpha]
 
             com[alpha] = (val / mtot).compress(
-                nterms_thresh=1, tol=self.compress_tol, zero_tol=self.compress_zero_tol
+                nterms_thresh=1,
+                tol=self.compress_tol,
+                zero_tol=self.compress_zero_tol,
+                identity_tol=self.compress_identity_tol,
             )
 
         xyz_com = np.empty((self.natoms, 3), dtype=object)
@@ -738,6 +757,7 @@ class Gvib:
                     nterms_thresh=1,
                     tol=self.compress_tol,
                     zero_tol=self.compress_zero_tol,
+                    identity_tol=self.compress_identity_tol,
                 )
 
         return xyz_com, com
@@ -764,6 +784,7 @@ class Gvib:
                         nterms_thresh=1,
                         tol=self.compress_tol,
                         zero_tol=self.compress_zero_tol,
+                        identity_tol=self.compress_identity_tol,
                     )
 
         return out
@@ -799,6 +820,7 @@ class Gvib:
                     nterms_thresh=1,
                     tol=self.compress_tol,
                     zero_tol=self.compress_zero_tol,
+                    identity_tol=self.compress_identity_tol,
                 )
 
         return jmat
@@ -824,7 +846,10 @@ class Gvib:
         cof[2, 2] = a * e - b * d
 
         det = (a * cof[0, 0] + b * cof[0, 1] + c * cof[0, 2]).compress(
-            nterms_thresh=1, tol=self.compress_tol, zero_tol=self.compress_zero_tol
+            nterms_thresh=1,
+            tol=self.compress_tol,
+            zero_tol=self.compress_zero_tol,
+            identity_tol=self.compress_identity_tol,
         )
 
         try:
@@ -844,6 +869,7 @@ class Gvib:
                     nterms_thresh=1,
                     tol=self.compress_tol,
                     zero_tol=self.compress_zero_tol,
+                    identity_tol=self.compress_identity_tol,
                 )
 
         return ainv, det
@@ -865,6 +891,7 @@ class Gvib:
                         nterms_thresh=1,
                         tol=self.compress_tol,
                         zero_tol=self.compress_zero_tol,
+                        identity_tol=self.compress_identity_tol,
                     )
 
         return srot

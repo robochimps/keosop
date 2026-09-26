@@ -83,7 +83,9 @@ class SumProd:
             k for k, f in enumerate(term) if not cls.factor_is_constant(f, tol)
         )
 
-    def nmode_project(self, max_order, ref_indices, zero_tol=0.0, compress=True):
+    def nmode_project(
+        self, max_order, ref_indices, zero_tol=0.0, identity_tol=0.0, compress=True
+    ):
         """Return the exact truncated N-mode projection of sum-of-products
 
         For every product P(q)=prod_k f_k(q_k), write
@@ -149,9 +151,15 @@ class SumProd:
 
         out = SumProd(new_terms)
 
-        return out.compress_hashed(zero_tol=zero_tol) if compress else out
+        return (
+            out.compress_hashed(zero_tol=zero_tol, identity_tol=identity_tol)
+            if compress
+            else out
+        )
 
-    def nmode_mul(self, x, max_order, ref_indices, zero_tol=0.0, compress=True):
+    def nmode_mul(
+        self, x, max_order, ref_indices, zero_tol=0.0, identity_tol=0.0, compress=True
+    ):
         """Multiply two sum-of-products and return their exact truncated N-mode product"""
         if np.isscalar(x):
             return self.nmode_project(max_order, ref_indices, zero_tol) * x
@@ -182,7 +190,11 @@ class SumProd:
 
         out = SumProd(terms)
 
-        return out.compress_hashed(zero_tol=zero_tol) if compress else out
+        return (
+            out.compress_hashed(zero_tol=zero_tol, identity_tol=identity_tol)
+            if compress
+            else out
+        )
 
     @staticmethod
     def factor_key(f):
@@ -199,6 +211,38 @@ class SumProd:
         return np.all(np.abs(f) <= zero_tol)
 
     @staticmethod
+    def simplify_1d_factor(f, tol=1e-12):
+        """Simplify 1D sum-of-product factor if it is numerically constant"""
+        a0 = np.asarray(f, dtype=float)
+        if a0.size == 0 or not np.all(np.isfinite(a0)):
+            return a0, False
+
+        c = float(a0.flat[0])
+        scale0 = max(1.0, abs(c))
+        atol0 = float(tol) * scale0
+
+        if a0.size > 1 and abs(float(a0.flat[-1]) - c) > atol0:
+            return a0, False
+        if a0.size > 2 and abs(float(a0.flat[a0.size // 2]) - c) > atol0:
+            return a0, False
+
+        scale = max(1.0, float(np.max(np.abs(a0))))
+        atol = float(tol) * scale
+        if np.max(np.abs(a0 - c)) > atol:
+            return a0, False
+
+        # snap common constants
+        if abs(c) <= atol:
+            c = 0.0
+        elif abs(c - 1.0) <= atol:
+            c = 1.0
+        elif abs(c + 1.0) <= atol:
+            c = -1.0
+
+        out = np.full_like(a0, c, dtype=float)
+        return out, not np.array_equal(out, a0)
+
+    @staticmethod
     def factors_close(f1, f2, tol=0.0):
         """Compare two 1D sum-of-product factors"""
         f1 = np.asarray(f1)
@@ -213,7 +257,7 @@ class SumProd:
         # return np.max(np.abs(f1 - f2)) <= tol
         return np.all(np.abs(f1 - f2) <= tol)
 
-    def compress_hashed(self, zero_tol=0.0, max_sweeps=None):
+    def compress_hashed(self, zero_tol=0.0, max_sweeps=None, identity_tol=0.0):
         """Exactly combine sum-of-product terms using hash grouping
 
         For each coordinate k, terms that are identical in every factor except k
@@ -256,6 +300,7 @@ class SumProd:
 
                     merged = [f.copy() for f in group[0]]
                     merged[k] = np.add.reduce([t[k] for t in group])
+                    merged[k], _ = self.simplify_1d_factor(merged[k], tol=identity_tol)
                     changed = True
 
                     if not self.is_zero_factor(merged[k], zero_tol):
@@ -276,7 +321,9 @@ class SumProd:
             if j != k
         )
 
-    def compress_similar(self, tol=1e-10, zero_tol=0.0, max_sweeps=None):
+    def compress_similar(
+        self, tol=1e-10, zero_tol=0.0, max_sweeps=None, identity_tol=0.0
+    ):
         """Approximately combine sum-of-product terms using O(N^2) grouping"""
         terms = [[f.copy() for f in t] for t in self.terms]
 
@@ -306,6 +353,7 @@ class SumProd:
 
                     merged = [f.copy() for f in terms[i]]
                     used[i] = True
+                    merged_any = False
 
                     for j in range(i + 1, len(terms)):
                         if used[j]:
@@ -315,7 +363,12 @@ class SumProd:
                             merged[k] += terms[j][k]
                             used[j] = True
                             changed = True
+                            merged_any = True
 
+                    if merged_any:
+                        merged[k], _ = self.simplify_1d_factor(
+                            merged[k], tol=identity_tol
+                        )
                     if not self.is_zero_factor(merged[k], zero_tol):
                         new_terms.append(merged)
 
@@ -332,17 +385,23 @@ class SumProd:
         zero_tol=0.0,
         max_sweeps=None,
         nterms_thresh=COMPRESS_NTERMS_THRESH,
+        identity_tol=0.0,
     ):
         if self.nterms < nterms_thresh:
             return self
 
         # fast exact compression
-        sop = self.compress_hashed(zero_tol=zero_tol, max_sweeps=max_sweeps)
+        sop = self.compress_hashed(
+            zero_tol=zero_tol, max_sweeps=max_sweeps, identity_tol=identity_tol
+        )
 
         # optional approximate compression
         if tol > 0.0:
             sop = sop.compress_similar(
-                tol=tol, zero_tol=zero_tol, max_sweeps=max_sweeps
+                tol=tol,
+                zero_tol=zero_tol,
+                max_sweeps=max_sweeps,
+                identity_tol=identity_tol,
             )
 
         return sop
