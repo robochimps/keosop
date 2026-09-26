@@ -894,10 +894,31 @@ class Gvib:
 
             return gvib
 
-        tvec = self.build_tvec(xyz)
-        cvec_raw = self.build_cvec(xyz, tvec=tvec)
+        # Keep the user's original Cartesian SOP representation
+        # for the vibrational branch above
+
+        # -------------------------------------------------------------
+        # What is implemented below is described in detail in
+        #   Sørensen, G.O. (1979). A new approach to the Hamiltonian of nonrigid molecules.
+        #   In: Large Amplitude Motion in Molecules II. Topics in Current Chemistry, vol 82.
+        #   https://doi.org/10.1007/BFb0048009
+        #   The relevant Section 2.2.3.2 "Axis conventions and rotational s-vectors"
+        # -------------------------------------------------------------
+
+        # Rotational-frame branch need to be expressed in translation-reduced
+        # (COM-centered) coordinates, so we construct rho_i = r_i - R_COM only
+        # for frame inference/differentiation and rotational tangents
+        xyz_com, com = self.com_xyz(xyz)
+        tvec = self.build_tvec(xyz_com)
+
+        # build_cvec(xyz_com) evaluates dC/drho at the COM-centered geometry,
+        # and to obtain derivatives with respect to the original Cartesian
+        # coordinates r, apply the COM chain rule in cvec_translation_free(cvec)
+        cvec_raw = self.build_cvec(xyz_com, tvec=tvec)
         cvec = self.cvec_translation_free(cvec_raw)
 
+        # cvec is now translation-reduced and tvec is a pure rotation about the COM,
+        # so J will be built in the translation-reduced frame
         J = self.build_jmat(cvec, tvec)
         Jinv, detJ = self.inverse_3x3_mat(J)
         srot = self.build_rot_svec(Jinv, cvec)
@@ -910,9 +931,12 @@ class Gvib:
                 grr,
                 {
                     "xyz": xyz,
+                    "xyz_com": xyz_com,
+                    "com": com,
                     "svib": svib,
                     "srot": srot,
                     "cvec": cvec,
+                    "cvec_raw": cvec_raw,
                     "tvec": tvec,
                     "J": J,
                     "Jinv": Jinv,
