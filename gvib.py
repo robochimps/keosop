@@ -713,6 +713,61 @@ class Gvib:
 
         return cvec
 
+    def com_xyz(self, xyz_sop):
+        """Return Cartesian SOP coordinates relative to the center of mass"""
+        mtot = float(np.sum(self.masses))
+
+        com = np.empty(3, dtype=object)
+
+        for alpha in range(3):
+            val = SumProd.constant(0.0, self.grids)
+
+            for i, mass in enumerate(self.masses):
+                val = val + float(mass) * xyz_sop[i, alpha]
+
+            com[alpha] = (val / mtot).compress(
+                nterms_thresh=1, tol=self.compress_tol, zero_tol=self.compress_zero_tol
+            )
+
+        xyz_com = np.empty((self.natoms, 3), dtype=object)
+
+        for i in range(self.natoms):
+            for alpha in range(3):
+
+                xyz_com[i, alpha] = (xyz_sop[i, alpha] - com[alpha]).compress(
+                    nterms_thresh=1,
+                    tol=self.compress_tol,
+                    zero_tol=self.compress_zero_tol,
+                )
+
+        return xyz_com, com
+
+    def cvec_translation_free(self, cvec):
+        """Project frame gradients onto the translation-free Cartesian subspace
+        c_{alpha,i,beta} = c_{alpha,i,beta} - m_i/M * sum_j c_{alpha,j,beta}
+        """
+        mtot = float(np.sum(self.masses))
+
+        out = np.empty_like(cvec, dtype=object)
+
+        for lam in range(3):
+            for alpha in range(3):
+                csum = SumProd.constant(0.0, self.grids)
+
+                for j in range(self.natoms):
+                    csum = csum + cvec[lam, j, alpha]
+
+                for i, mass in enumerate(self.masses):
+                    out[lam, i, alpha] = (
+                        cvec[lam, i, alpha] - (float(mass) / mtot) * csum
+                    ).compress(
+                        nterms_thresh=1,
+                        tol=self.compress_tol,
+                        zero_tol=self.compress_zero_tol,
+                    )
+
+        return out
+
     def build_tvec(self, xyz_sop):
         """Computes tvec_{i,alpha,beta} = sum_{gamma} eps_{alpha,beta,gamma} r_{i,gamma}"""
         zero = SumProd.constant(0.0, self.grids)
@@ -720,7 +775,7 @@ class Gvib:
 
         for i in range(self.natoms):
             x, y, z = xyz_sop[i]
-            vals = ((zero, -z, y), (z, zero, -x), (-y, x, zero))
+            vals = ((zero, z, -y), (-z, zero, x), (y, -x, zero))
 
             for alpha in range(3):
                 for beta in range(3):
@@ -840,7 +895,9 @@ class Gvib:
             return gvib
 
         tvec = self.build_tvec(xyz)
-        cvec = self.build_cvec(xyz, tvec=tvec)
+        cvec_raw = self.build_cvec(xyz, tvec=tvec)
+        cvec = self.cvec_translation_free(cvec_raw)
+
         J = self.build_jmat(cvec, tvec)
         Jinv, detJ = self.inverse_3x3_mat(J)
         srot = self.build_rot_svec(Jinv, cvec)
