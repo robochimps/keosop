@@ -2,7 +2,7 @@ from itertools import combinations
 
 import numpy as np
 
-from revad import (
+from keosop.revad import (
     Expr,
     _geom_cache,
     as_expr,
@@ -10,7 +10,7 @@ from revad import (
     init_cartesian,
     reverse_derivatives,
 )
-from sumprod import SumProd, init_internal, sop_reciprocal, sop_ufunc
+from keosop.sumprod import SumProd, init_internal, sop_reciprocal, sop_ufunc
 
 
 def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
@@ -72,7 +72,7 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
     return out
 
 
-class Gvib:
+class Gmat:
     def __init__(
         self,
         grids,
