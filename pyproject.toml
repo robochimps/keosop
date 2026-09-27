@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keosop"
+version = "0.1.0"
+description = "Molecular rovibrational kinetic energy operators in sum-of-products form"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Robochimps", email = "andrey.yachmenev@robochimps.com" }]
+dependencies = ["jax>=0.5.3", "numpy>=2.2.4", "scipy>=1.15.2"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["keosop*"]
+
+[project.urls]
+Homepage = "https://github.com/robochimps/keosop"
