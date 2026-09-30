@@ -281,6 +281,13 @@ class Gmat:
                         identity_tol=self.compress_identity_tol,
                     )
 
+                    # terms with the same protected analytical prefactor may still cancel
+                    # even when their 1D arrays differ only by an overall scalar or sign
+                    g = g.collect_final_terms(
+                        zero_tol=self.compress_zero_tol,
+                        identity_tol=max(self.compress_identity_tol, 1e-12),
+                    )
+
                 if self.nmode_order is not None:
                     g = g.nmode_project(
                         self.nmode_order,
