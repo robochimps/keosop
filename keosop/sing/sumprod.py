@@ -657,6 +657,143 @@ class SumProd:
 
         return SumProd(terms, protected=sigs, grids=self.grids)
 
+    def collect_final_terms(self, zero_tol=0.0, identity_tol=1e-12, max_sweeps=None):
+        """Performs final G-matrix compression for terms with the same protected factor.
+
+        This is not used in the general sum-of-products path, but only for G-matrix:
+        canonicalizes each 1D factor up to a scalar, combines fully proportional terms,
+        and then exactly collects terms that are proportional in every coordinate except one.
+
+        Terms carrying different analytical prefactors are never merged.
+        """
+        sop = self.compress_hashed(zero_tol=zero_tol, identity_tol=identity_tol)
+        terms = [[np.asarray(f, dtype=float).copy() for f in t] for t in sop.terms]
+        sigs = list(sop.protected)
+
+        def canonicalize(term):
+            canon = []
+            coeff = 1.0
+
+            for f in term:
+                cf, sc = self.canonical_factor_scale(f)
+
+                if sc == 0.0:
+                    return None, 0.0
+
+                canon.append(cf)
+                coeff *= sc
+
+            return canon, coeff
+
+        def same_factor(a, b):
+            return self.factors_close(a, b, tol=identity_tol)
+
+        def cancel_fully_proportional(terms, sigs):
+            groups = []  # (signature, canonical factors, accumulated coefficient)
+
+            for term, sig in zip(terms, sigs):
+                canon, coeff = canonicalize(term)
+
+                if canon is None or abs(coeff) <= zero_tol:
+                    continue
+
+                found = False
+                for g in groups:
+                    if sig == g[0] and all(
+                        same_factor(a, b) for a, b in zip(canon, g[1])
+                    ):
+                        g[2] += coeff
+                        found = True
+                        break
+
+                if not found:
+                    groups.append([sig, canon, coeff])
+
+            out_t = []
+            out_s = []
+            for sig, canon, coeff in groups:
+                if abs(coeff) <= zero_tol:
+                    continue
+
+                term = [f.copy() for f in canon]
+                term[0] *= coeff
+
+                out_t.append(term)
+                out_s.append(sig)
+
+            return out_t, out_s
+
+        terms, sigs = cancel_fully_proportional(terms, sigs)
+        if not terms:
+            return SumProd.constant(0.0, self.dummy_grids())
+
+        sweep = 0
+        changed = True
+
+        while changed and (max_sweeps is None or sweep < max_sweeps):
+            changed = False
+            sweep += 1
+
+            for k in range(self.ncoo):
+                used = [False] * len(terms)
+                new_terms = []
+                new_sigs = []
+
+                for i in range(len(terms)):
+                    if used[i]:
+                        continue
+
+                    used[i] = True
+                    base, sig = terms[i], sigs[i]
+                    cbase, _ = canonicalize(base)
+                    group = [i]
+
+                    for j in range(i + 1, len(terms)):
+                        if used[j] or sigs[j] != sig:
+                            continue
+
+                        cj, _ = canonicalize(terms[j])
+
+                        if all(
+                            same_factor(cbase[m], cj[m])
+                            for m in range(self.ncoo)
+                            if m != k
+                        ):
+                            group.append(j)
+                            used[j] = True
+
+                    if len(group) == 1:
+                        new_terms.append([f.copy() for f in base])
+                        new_sigs.append(sig)
+                        continue
+
+                    # place all proportional scales of coordinates != k into k,
+                    # e.g., a*b*c + a*b*d = a*b*(c+d)
+                    ref = cbase
+                    merged_k = np.zeros_like(base[k], dtype=float)
+                    for idx in group:
+                        cterm, coeff = canonicalize(terms[idx])
+                        merged_k += coeff * cterm[k]
+
+                    merged = [f.copy() for f in ref]
+                    merged[k] = merged_k
+                    merged[k], _ = self.simplify_1d_factor(merged[k], tol=identity_tol)
+
+                    changed = True
+                    if not self.is_zero_factor(merged[k], zero_tol):
+                        new_terms.append(merged)
+                        new_sigs.append(sig)
+
+                terms, sigs = cancel_fully_proportional(new_terms, new_sigs)
+
+                if not terms:
+                    return SumProd.constant(0.0, self.dummy_grids())
+
+        sop = SumProd(terms, protected=sigs, grids=self.grids).compress_hashed(
+            zero_tol=zero_tol, identity_tol=identity_tol
+        )
+        return sop
+
     def collect_one_coordinate(self, zero_tol=0.0, max_sweeps=None, identity_tol=0.0):
         """Exactly collect terms that differ in only one coordinate.
 
