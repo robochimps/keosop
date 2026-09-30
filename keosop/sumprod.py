@@ -90,12 +90,13 @@ class SumProd:
 
         For every product P(q)=prod_k f_k(q_k), write
 
-            f_k(q_k) = c_k + d_k(q_k),  c_k=f_k(q_k^0),
+            f_k(q_k) = f_k(q_k^0) + d_k(q_k)
 
         where q_k^0 is selected by `ref_indices[k]`.
+
         Expanding the product and retaining subsets containing at most `max_order`
         d-factors gives the truncated N-mode expansion.
-        Therefore, every returned nonconstant term contains at most `max_order`
+        Every returned nonconstant term contains at most `max_order`
         simultaneously coupled coordinates.
         """
         if max_order < 0:

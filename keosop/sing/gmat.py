@@ -2,7 +2,7 @@ from itertools import combinations
 
 import numpy as np
 
-from keosop.revad import (
+from keosop.sing.revad import (
     Expr,
     _geom_cache,
     as_expr,
@@ -10,7 +10,7 @@ from keosop.revad import (
     init_cartesian,
     reverse_derivatives,
 )
-from keosop.sumprod import (
+from keosop.sing.sumprod import (
     SumProd,
     configure_singularity_tracing,
     init_internal,
