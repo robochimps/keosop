@@ -8,9 +8,73 @@ from keosop.revad import (
     as_expr,
     expr_signature,
     init_cartesian,
+    dot,
+    norm,
     reverse_derivatives,
 )
 from keosop.sumprod import SumProd, init_internal, sop_reciprocal, sop_ufunc
+
+
+def geom_expanded_signatures(node):
+    """Return structural signatures corresponding to an atomic geometry node.
+
+    Used as aliases when user-defined Cartesian-to-internal coordinates
+    are written using norm, dot, or arccos functions rather than the atomic
+    distance() or angle() primitives.
+    """
+    args = node.args
+
+    if node.oper == "distance":
+        A = np.array(args[0:3], dtype=object)
+        B = np.array(args[3:6], dtype=object)
+        # distance() primitive uses defined endpoints, but user may
+        # write either norm(A-B) or norm(B-A), so try both
+        return {expr_signature(norm(A - B)), expr_signature(norm(B - A))}
+
+    if node.oper == "angle":
+        A = np.array(args[0:3], dtype=object)
+        B = np.array(args[3:6], dtype=object)
+        C = np.array(args[6:9], dtype=object)
+
+        def expanded(P, Q, R):
+            u = P - Q
+            v = R - Q
+            return np.arccos(dot(u, v) / (norm(u) * norm(v)))
+
+        # angle() primitive uses defined ordering of the two outer atoms,
+        # so try both representations to match user's convention
+        return {expr_signature(expanded(A, B, C)), expr_signature(expanded(C, B, A))}
+
+    return set()
+
+
+def add_user_geometry_aliases(q_expr, q_bindings):
+    """Bind atomic distance or angle nodes to equivalent user-defined nodes.
+
+    This is on purpose made local to vibrational derivative evaluation.
+    It does not affect reverse AD, the geometry cache, or the rotational-frame path.
+    """
+    sig_to_sop = {expr_signature(qnode): q_bindings[qnode.id] for qnode in q_expr}
+
+    out = dict(q_bindings)
+
+    for node in tuple(_geom_cache.values()):
+        if node.oper not in ("distance", "angle"):
+            continue
+
+        # if already an explicit internal-coordinate primitive
+        if node.id in out or ("sig", expr_signature(node)) in out:
+            continue
+
+        for sig in geom_expanded_signatures(node):
+            q_sop = sig_to_sop.get(sig)
+
+            if q_sop is not None:
+                out[node.id] = q_sop
+                out[("sig", expr_signature(node))] = q_sop
+                break
+
+    return out
 
 
 def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
@@ -202,6 +266,12 @@ class Gmat:
             # graph for derivative dq_icoo / dx
             deriv = reverse_derivatives(root)
 
+            # reverse rules for dihedral can introduce atomic distance()
+            # and angle() factors, so if the user defined the same coordinates
+            # using norm(), dot(), or arccos(), we need to add temporary structural
+            # aliases to the corresponding one-dimensional q SOPs
+            local_q_bindings = add_user_geometry_aliases(q_expr, q_bindings)
+
             for i in range(self.natoms):
                 for ialpha, alpha in enumerate(("x", "y", "z")):
 
@@ -212,7 +282,7 @@ class Gmat:
                         deriv.get(f"{alpha}{i}", as_expr(0)),
                         xyz_bindings,
                         self.grids,
-                        q_bindings,
+                        local_q_bindings,
                     )
 
         return svec
