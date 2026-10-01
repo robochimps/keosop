@@ -386,22 +386,56 @@ def reverse_derivatives(root):
             b3 = _vsub(D, C)
             n1 = cross(b1, b2)
             n2 = cross(b2, b3)
-            r12 = norm(_vsub(A, B))
-            r23 = norm(_vsub(C, B))
-            # |n2| = |(C-B) x (D-B)|, so the norm can be expressed with
-            # the internal distance |D-B| and angle C-B-D
-            rBD = norm(_vsub(D, B))
-            u1 = _vsub(A, B)
-            v1 = _vsub(C, B)
-            th1 = np.arccos(dot(u1, v1) / (norm(u1) * norm(v1)))
-            u2 = _vsub(C, B)
-            v2 = _vsub(D, B)
-            th2 = np.arccos(dot(u2, v2) / (norm(u2) * norm(v2)))
-            # |n1|^2 = r12^2 r23^2 sin(th1)^2
-            # |n2|^2 = r23^2 rBD^2 sin(th2)^2
-            # sum-of-products-friendly way of writing the denominators
+
+            # keep all factors as atomic geometry primitives,
+            # which are themselves internal coordinates (at least for Z-matrix coo);
+            # q_bindings in Gmat will replace them by one-dimensional SOP factors
+            # before any Cartesian norm or sqrt is evaluated
+            r12 = distance(A, B)
+            r23 = distance(C, B)
+            th1 = angle(A, B, C)
+
+            # second-plane normal n2=(C-B)x(D-C) can be obtained
+            # from either triangle representation of plane B-C-D:
+            # |n2|^2 = BC^2 BD^2 sin(angle(C,B,D))^2
+            # or
+            # |n2|^2 = BC^2 CD^2 sin(angle(B,C,D))^2
+
+            # prefer representation whose distance and angle nodes already exist
+            # in the geometry cache (i.e. are themselves internal coordinates)
+            def _cached_distance(P, Q):
+                P, Q = _point_xyz(P), _point_xyz(Q)
+                if tuple(x.id for x in P) > tuple(x.id for x in Q):
+                    P, Q = Q, P
+                key = _geom_key("distance", *(tuple(P) + tuple(Q)))
+                return _geom_cache.get(key)
+
+            def _cached_angle(P, Q, R):
+                P, Q, R = _point_xyz(P), _point_xyz(Q), _point_xyz(R)
+                if tuple(x.id for x in P) > tuple(x.id for x in R):
+                    P, R = R, P
+                key = _geom_key("angle", *(tuple(P) + tuple(Q) + tuple(R)))
+                return _geom_cache.get(key)
+
+            rBD = _cached_distance(B, D)
+            thB = _cached_angle(C, B, D)
+            rCD = _cached_distance(C, D)
+            thC = _cached_angle(B, C, D)
+
+            if rBD is not None and thB is not None:
+                n2sq = (r23 * r23) * (rBD * rBD) * np.sin(thB) * np.sin(thB)
+            elif rCD is not None and thC is not None:
+                n2sq = (r23 * r23) * (rCD * rCD) * np.sin(thC) * np.sin(thC)
+            else:
+                # make compatible with user-defined transforms:
+                # create the primitives and let local structural aliasing
+                # in Gmat match them to norm or arccos coordinates if possible
+                rBD = distance(B, D)
+                thB = angle(C, B, D)
+                n2sq = (r23 * r23) * (rBD * rBD) * np.sin(thB) * np.sin(thB)
+
+            # first-plane normal is obtained form direct A-B-C quantities
             n1sq = (r12 * r12) * (r23 * r23) * np.sin(th1) * np.sin(th1)
-            n2sq = (r23 * r23) * (rBD * rBD) * np.sin(th2) * np.sin(th2)
             # standard signed-dihedral endpoint gradients for b1=B-A, b2=C-B, b3=D-C
             gA = _vscale(-r23 / n1sq, n1)
             gD = _vscale(r23 / n2sq, n2)
