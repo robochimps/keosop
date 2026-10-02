@@ -55,6 +55,23 @@ class Expr:
     def __array_ufunc__(self, ufunc, method, *args, **kwargs):
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
+
+        # numpy scalar constants
+        if ufunc is np.add and len(args) == 2:
+            return Expr("add", (as_expr(args[0]), as_expr(args[1])))
+        if ufunc is np.subtract and len(args) == 2:
+            return Expr("add", (as_expr(args[0]), Expr("neg", (as_expr(args[1]),))))
+        if ufunc is np.multiply and len(args) == 2:
+            return Expr("mul", (as_expr(args[0]), as_expr(args[1])))
+        if ufunc in (np.divide, np.true_divide) and len(args) == 2:
+            return Expr("div", (as_expr(args[0]), as_expr(args[1])))
+        if ufunc is np.negative and len(args) == 1:
+            return Expr("neg", (as_expr(args[0]),))
+        if ufunc is np.positive and len(args) == 1:
+            return as_expr(args[0])
+        if ufunc is np.power and len(args) == 2 and np.isscalar(args[1]):
+            return Expr("pow", (as_expr(args[0]),), float(args[1]))
+
         x = tuple(as_expr(inp) for inp in args)
         ufunc_dict = {
             np.sin: "sin",
