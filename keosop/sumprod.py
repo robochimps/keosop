@@ -584,16 +584,96 @@ def check_sop_unary(sop: SumProd):
     return ("depends_on_one_coo", icoo, values)
 
 
+def additive_1d_decomposition(sop: SumProd):
+    """Return `c, [(icoo, values), ...]` for c + sum_k f_k(q_k),
+    that is, if sum-of-products object be written as a constant plus
+    a sum of functions that each depend on only one coordinate.
+    """
+    constant = 0.0
+    by_coordinate = {}
+
+    for term in sop.terms:
+        active = [
+            k for k, factor in enumerate(term) if not sop.factor_is_constant(factor)
+        ]
+        if len(active) > 1:
+            return None
+
+        if not active:
+            constant += float(np.prod([factor[0] for factor in term]))
+            continue
+
+        icoo = active[0]
+        scale = float(
+            np.prod([factor[0] for k, factor in enumerate(term) if k != icoo])
+        )
+        values = scale * np.asarray(term[icoo], dtype=float)
+
+        if icoo in by_coordinate:
+            by_coordinate[icoo] += values
+        else:
+            by_coordinate[icoo] = values.copy()
+
+    pieces = []
+    for icoo in sorted(by_coordinate):
+        values = by_coordinate[icoo]
+
+        if sop.factor_is_constant(values):
+            constant += float(values[0])
+        else:
+            pieces.append((icoo, values))
+
+    return constant, pieces
+
+
+def sincos_additive_sum(sop: SumProd, grids):
+    """Exact SOPs identities for sin(SumProd), cos(SumProd)
+    when SumProd is additively separable
+    """
+    decomposition = additive_1d_decomposition(sop)
+    if decomposition is None:
+        return None
+
+    constant, pieces = decomposition
+    sin_sum = SumProd.constant(np.sin(constant), grids)
+    cos_sum = SumProd.constant(np.cos(constant), grids)
+
+    for icoo, values in pieces:
+        sin_a = SumProd.init_coordinate(icoo, grids, lambda _, v=values: np.sin(v))
+        cos_a = SumProd.init_coordinate(icoo, grids, lambda _, v=values: np.cos(v))
+
+        new_sin = sin_sum * cos_a + cos_sum * sin_a
+        new_cos = cos_sum * cos_a - sin_sum * sin_a
+
+        # merge exact duplicates and cancellations
+        sin_sum = new_sin.compress_hashed(max_sweeps=1)
+        cos_sum = new_cos.compress_hashed(max_sweeps=1)
+
+    return sin_sum, cos_sum
+
+
 def sop_ufunc(sop: SumProd, grids, func, func_name):
     kind, icoo, terms = check_sop_unary(sop)
-    if kind in ("sum_of_more_than_one_term", "depends_on_more_than_one_coo"):
-        raise NotImplementedError(
-            f"{func_name} of a multi-term sum-of-products requires a low-rank approximation."
-        )
-    elif kind == "const":
+
+    if kind == "const":
         return SumProd.constant(float(func(terms[0])), grids)
-    else:
+
+    if kind == "depends_on_one_coo":
         return SumProd.init_coordinate(icoo, grids, lambda _: func(terms))
+
+    # sin and cos of c + f1(q_i) + f2(q_j) + ... have an exact finite
+    # sum-of-products representation via trigonometric identities
+    if func_name in ("sin", "cos"):
+        sincos = sincos_additive_sum(sop, grids)
+
+        if sincos is not None:
+            sin_sop, cos_sop = sincos
+            return sin_sop if func_name == "sin" else cos_sop
+
+    raise NotImplementedError(
+        f"{func_name} of this multivariate sum-of-products cannot be represented "
+        "by the currently implemented exact SOP unary rules"
+    )
 
 
 def sop_reciprocal(sop: SumProd, tol: float = 1e-9):
