@@ -97,3 +97,69 @@ def Gmat(
 
 
 batch_Gmat = jax.jit(jax.vmap(Gmat, in_axes=(0, None, None)), static_argnums=2)
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def jac_Gmat(q, masses, internal_to_cartesian):
+    return jax.jacfwd(Gmat)(q, masses, internal_to_cartesian)
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def jac_Gmat_vib(q, masses, internal_to_cartesian):
+    nq = len(q)
+    return jax.jacfwd(lambda *arg: Gmat(*arg)[:nq, :nq])(
+        q, masses, internal_to_cartesian
+    )
+
+
+@jax.jit
+def log_abs_det(a):
+    return jnp.log(jnp.abs(jnp.linalg.det(a)))
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def det_gmat(q, masses, internal_to_cartesian):
+    nq = len(q)
+    return jnp.linalg.det(gmat(q, masses, internal_to_cartesian)[: nq + 3, : nq + 3])
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def log_abs_det_gmat(q, masses, internal_to_cartesian):
+    nq = len(q)
+    return log_abs_det(gmat(q, masses, internal_to_cartesian)[: nq + 3, : nq + 3])
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def jac_log_abs_det_gmat(q, masses, internal_to_cartesian):
+    return jax.jacrev(log_abs_det_gmat)(q, masses, internal_to_cartesian)
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def hess_log_abs_det_gmat(q, masses, internal_to_cartesian):
+    return jax.jacfwd(jax.jacrev(log_abs_det_gmat))(q, masses, internal_to_cartesian)
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def pseudo(
+    q: np.ndarray,
+    masses: np.ndarray,
+    internal_to_cartesian: Callable[[jnp.ndarray], jnp.ndarray],
+):
+    """Pseudopotential implementation according to Eq. (21)
+    in Edit Mátyus, Gábor Czakó, and Attila G. Császár,
+    J. Chem. Phys. 130, 134112 (2009)
+    http://dx.doi.org/10.1063/1.3076742
+    """
+    nq = len(q)
+    G = Gmat(q, masses, internal_to_cartesian)[:nq, :nq]
+    dG = jac_Gmat_vib(q, masses, internal_to_cartesian)
+    k = jnp.arange(nq)
+    dG = dG[k, :, k]
+    dlogdet = jac_log_abs_det_gmat(q, masses, internal_to_cartesian)
+    hlogdet = hess_log_abs_det_gmat(q, masses, internal_to_cartesian)
+    pseudo1 = dlogdet @ G @ dlogdet
+    pseudo2 = jnp.sum(dG @ dlogdet) + jnp.sum(G * hlogdet)
+    return (pseudo1 + 4 * pseudo2) / 32.0
+
+
+batch_pseudo = jax.jit(jax.vmap(pseudo, in_axes=(0, None, None)), static_argnums=2)
