@@ -978,6 +978,261 @@ class Gmat:
 
         return gvv, grv, grr
 
+    @staticmethod
+    def fdf_weights(x0, x, order):
+        """Finite-difference weights for d**order/dx**order at x0"""
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        if order < 0 or order >= n:
+            raise ValueError(
+                "finite-difference derivative order must be < stencil size"
+            )
+        dx = x - float(x0)
+        A = np.vstack([dx**k for k in range(n)])
+        b = np.zeros(n, dtype=float)
+        b[order] = (
+            float(np.math.factorial(order))
+            if hasattr(np, "math")
+            else float(__import__("math").factorial(order))
+        )
+        return np.linalg.solve(A, b)
+
+    def fdf_augmented_grids(self, stencil=5, step_scale=0.01):
+        """Augment every user grid point by local finite-difference points"""
+        if stencil < 3 or stencil % 2 == 0:
+            raise ValueError("stencil must be an odd integer >= 3")
+
+        if step_scale <= 0.0:
+            raise ValueError("step_scale must be positive")
+
+        radius = stencil // 2
+        aug_grids = []
+        info = []
+
+        for g in self.grids:
+            g = np.asarray(g, dtype=float)
+
+            if len(g) < 2:
+                raise ValueError(
+                    "each grid needs at least two points for finite differences"
+                )
+
+            if np.any(np.diff(g) <= 0.0):
+                raise ValueError(
+                    "finite-difference pseudopotential requires strictly increasing grids"
+                )
+
+            local_h = np.empty(len(g), dtype=float)
+            for i in range(len(g)):
+                if i == 0:
+                    scale = g[1] - g[0]
+                elif i == len(g) - 1:
+                    scale = g[-1] - g[-2]
+                else:
+                    scale = min(g[i] - g[i - 1], g[i + 1] - g[i])
+
+                local_h[i] = step_scale * scale
+
+            pts = list(g)
+            stencils = []
+
+            for x0, h in zip(g, local_h):
+                xs = x0 + h * np.arange(-radius, radius + 1, dtype=float)
+
+                pts.extend(xs.tolist())
+                stencils.append(xs)
+
+            aug = np.unique(np.asarray(pts, dtype=float))
+            aug.sort()
+
+            coord_info = []
+            for x0, xs in zip(g, stencils):
+                inds = np.array(
+                    [int(np.argmin(np.abs(aug - x))) for x in xs], dtype=int
+                )
+
+                # stencil points should match to roundoff
+                if np.max(np.abs(aug[inds] - xs)) > 1e-11 * max(
+                    1.0, np.max(np.abs(xs))
+                ):
+                    raise RuntimeError(
+                        "failed to locate finite-difference stencil in augmented grid"
+                    )
+
+                w1 = self.fdf_weights(x0, aug[inds], 1)
+                w2 = self.fdf_weights(x0, aug[inds], 2)
+                coord_info.append((inds, w1, w2))
+
+            orig_inds = np.array(
+                [int(np.argmin(np.abs(aug - x))) for x in g], dtype=int
+            )
+
+            aug_grids.append(aug)
+            info.append({"points": coord_info, "orig_inds": orig_inds})
+
+        return aug_grids, info
+
+    def fdf_sop(self, sop, fd_info, deriv_orders=None):
+        """Differentiate sum-of-products terms using 1D finite-differences"""
+        if deriv_orders is None:
+            deriv_orders = [0] * self.ncoo
+
+        if len(deriv_orders) != self.ncoo:
+            raise ValueError("deriv_orders has wrong length")
+
+        terms = []
+
+        for term in sop.terms:
+            newterm = []
+
+            for k, factor in enumerate(term):
+                factor = np.asarray(factor, dtype=float)
+                order = int(deriv_orders[k])
+                ci = fd_info[k]
+
+                if order == 0:
+                    vals = factor[ci["orig_inds"]]
+
+                elif order in (1, 2):
+                    vals = np.empty(len(self.grids[k]), dtype=float)
+
+                    for j, (inds, w1, w2) in enumerate(ci["points"]):
+                        vals[j] = np.dot(w1 if order == 1 else w2, factor[inds])
+
+                else:
+                    raise ValueError("only derivative orders 0, 1, and 2 are supported")
+
+                newterm.append(vals)
+
+            terms.append(newterm)
+
+        return SumProd(terms)
+
+    def fdf_add(self, acc, value):
+        out = acc + value
+        if out.nterms >= self.compress_nterms_thresh:
+            out = out.compress(
+                tol=self.compress_tol,
+                zero_tol=self.compress_zero_tol,
+                identity_tol=self.compress_identity_tol,
+            )
+        return out
+
+    def build_pseudopotential_fdf(self, stencil=5, step_scale=0.01):
+        """Build the pseudopotential by 1D finite differences of SOP factors"""
+        aug_grids, fd_info = self.fdf_augmented_grids(stencil, step_scale)
+
+        # construct the s-vectors on the augmented 1D grids
+        aug = Gmat(
+            aug_grids,
+            self.masses,
+            self.internal_to_cartesian,
+            self.cartesian_to_internal,
+            frame_conditions=self.frame_conditions,
+            compress_tol=self.compress_tol,
+            compress_zero_tol=self.compress_zero_tol,
+            compress_identity_tol=self.compress_identity_tol,
+            compress_nterms_thresh=self.compress_nterms_thresh,
+            nmode_order=None,
+        )
+
+        _, _, _, aux = aug.run(return_rot=True, return_svec=True)
+        svib_a, srot_a = aux["svib"], aux["srot"]
+
+        # s-vectors represented on the original grids
+        zord = [0] * self.ncoo
+        svib = np.empty_like(svib_a)
+        srot = np.empty_like(srot_a)
+
+        for n in range(self.ncoo):
+            for i in range(self.natoms):
+                for a in range(3):
+                    svib[n, i, a] = self.fdf_sop(svib_a[n, i, a], fd_info, zord)
+
+        for b in range(3):
+            for i in range(self.natoms):
+                for a in range(3):
+                    srot[b, i, a] = self.fdf_sop(srot_a[b, i, a], fd_info, zord)
+
+        eps_terms = (
+            (0, 1, 2, 1.0),
+            (1, 2, 0, 1.0),
+            (2, 0, 1, 1.0),
+            (0, 2, 1, -1.0),
+            (2, 1, 0, -1.0),
+            (1, 0, 2, -1.0),
+        )
+
+        zero = SumProd.constant(0.0, self.grids)
+        U = zero
+
+        # cache derivatives because the same 1D derivatives occur across several expressions
+        dsv_diag = {}
+        dsrot = {}
+        d2sv = {}
+
+        for i, mass in enumerate(self.masses):
+            mass = float(mass)
+
+            term1 = zero
+            for alpha in range(3):
+                w = zero
+                for aa, beta, gamma, sign in eps_terms:
+                    if aa == alpha:
+                        w = self.fdf_add(w, sign * srot[beta, i, gamma])
+                term1 = self.fdf_add(term1, 0.5 * w * w)
+
+            term2 = zero
+            for alpha, beta, gamma, sign in eps_terms:
+                for n in range(self.ncoo):
+                    key = (beta, i, alpha, n)
+                    if key not in dsrot:
+                        orders = [0] * self.ncoo
+                        orders[n] = 1
+                        dsrot[key] = self.fdf_sop(
+                            srot_a[beta, i, alpha], fd_info, orders
+                        )
+                    term2 = self.fdf_add(term2, sign * svib[n, i, gamma] * dsrot[key])
+
+            term3 = zero
+            for alpha in range(3):
+                for n in range(self.ncoo):
+                    for m in range(self.ncoo):
+                        key = (m, i, alpha, n, m)
+                        if key not in d2sv:
+                            orders = [0] * self.ncoo
+                            if n == m:
+                                orders[n] = 2
+                            else:
+                                orders[n] = 1
+                                orders[m] = 1
+                            d2sv[key] = self.fdf_sop(
+                                svib_a[m, i, alpha], fd_info, orders
+                            )
+                        term3 = self.fdf_add(term3, svib[n, i, alpha] * d2sv[key])
+
+            term4 = zero
+            for alpha in range(3):
+                divs = zero
+                for n in range(self.ncoo):
+                    key = (n, i, alpha)
+                    if key not in dsv_diag:
+                        orders = [0] * self.ncoo
+                        orders[n] = 1
+                        dsv_diag[key] = self.fdf_sop(
+                            svib_a[n, i, alpha], fd_info, orders
+                        )
+                    divs = self.fdf_add(divs, dsv_diag[key])
+                term4 = self.fdf_add(term4, 0.5 * divs * divs)
+
+            U = self.fdf_add(U, (0.25 / mass) * (term1 + term2 - term3 - term4))
+
+        return U.compress(
+            tol=self.compress_tol,
+            zero_tol=self.compress_zero_tol,
+            identity_tol=self.compress_identity_tol,
+        )
+
     def run(self, return_rot=False, return_svec=False):
         """Build SOP G matrices"""
         xyz = self.sumprod_x()
