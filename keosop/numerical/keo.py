@@ -162,4 +162,26 @@ def pseudo(
     return (pseudo1 + 4 * pseudo2) / 32.0
 
 
-batch_pseudo = jax.jit(jax.vmap(pseudo, in_axes=(0, None, None)), static_argnums=2)
+# batch_pseudo = jax.jit(jax.vmap(pseudo, in_axes=(0, None, None)), static_argnums=2)
+
+
+def batch_pseudo(q, masses, internal_to_cartesian, batch_size=10000):
+    npoints = q.shape[0]
+
+    eff_batch_size = min(batch_size, npoints)
+    n_batches = (npoints + eff_batch_size - 1) // eff_batch_size
+    n_padded = n_batches * eff_batch_size
+    pad_size = n_padded - npoints
+
+    q_padded = jnp.pad(q, ((0, pad_size), (0, 0)), mode="constant")
+    q_batches = q_padded.reshape(n_batches, batch_size, q.shape[1])
+
+    pseudo_batch = jax.vmap(pseudo, in_axes=(0, None, None))
+
+    def scan_body(carry, q_batch):
+        values = pseudo_batch(q_batch, masses, internal_to_cartesian)
+        return carry, values
+
+    _, values = jax.lax.scan(scan_body, None, q_batches)
+
+    return values.reshape(-1)[:npoints]
