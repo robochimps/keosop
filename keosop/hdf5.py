@@ -116,6 +116,7 @@ def save_gmat_hdf5(
     gvib_sop,
     grovib_sop=None,
     grot_sop=None,
+    pseudo_sop=None,
     coo_names=None,
     coo_units=None,
     metadata=None,
@@ -170,6 +171,9 @@ def save_gmat_hdf5(
         _write_matrix(mat_group, "gvib", gvib_sop, sizes, compress)
         _write_matrix(mat_group, "grovib", grovib_sop, sizes, compress)
         _write_matrix(mat_group, "grot", grot_sop, sizes, compress)
+        if pseudo_sop is not None:
+            pseudo_group = h5.create_group("pseudo")
+            _write_element(pseudo_group, pseudo_sop, sizes, compress)
 
 
 def _default_sumprod_class():
@@ -287,6 +291,10 @@ def load_gmat_hdf5(filename, sumprod_cls=None, return_metadata=False):
         gvib = _read_matrix(mat_group, "gvib", grids, sumprod_cls)
         grovib = _read_matrix(mat_group, "grovib", grids, sumprod_cls)
         grot = _read_matrix(mat_group, "grot", grids, sumprod_cls)
+        if "pseudo" in h5:
+            pseudo = _read_element(h5["pseudo"], grids, sumprod_cls)
+        else:
+            pseudo = None
 
         metadata = {str(k): h5.attrs[k] for k in h5.attrs.keys()}
 
@@ -296,6 +304,6 @@ def load_gmat_hdf5(filename, sumprod_cls=None, return_metadata=False):
         if "units" in coo_group:
             metadata["coo_units"] = [_as_text(x) for x in coo_group["units"][...]]
 
-    result = (grids, gvib, grovib, grot)
+    result = (grids, gvib, grovib, grot, pseudo)
 
     return result + (metadata,) if return_metadata else result
