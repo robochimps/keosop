@@ -48,7 +48,7 @@ def _put_plane(planes, a, b, c, n):
     planes[(b, a, c)] = nn
 
 
-def internal_to_cartesian(zmat_connections, internal, pm=1, exact_sop=True):
+def internal_to_cartesian(zmat_connections, internal, pm=1):
     if pm not in (-1, 1):
         raise ValueError("pm must be +1 or -1")
 
