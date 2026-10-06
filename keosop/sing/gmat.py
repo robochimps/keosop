@@ -1,3 +1,4 @@
+import math
 from itertools import combinations
 
 import numpy as np
@@ -6,8 +7,10 @@ from keosop.sing.revad import (
     Expr,
     _geom_cache,
     as_expr,
+    dot,
     expr_signature,
     init_cartesian,
+    norm,
     reverse_derivatives,
 )
 from keosop.sing.sumprod import (
@@ -17,6 +20,66 @@ from keosop.sing.sumprod import (
     sop_reciprocal,
     sop_ufunc,
 )
+
+
+def geom_expanded_signatures(node):
+    """Return structural signatures corresponding to an atomic geometry node.
+
+    Used as aliases when user-defined Cartesian-to-internal coordinates
+    are written using norm, dot, or arccos functions rather than the atomic
+    distance() or angle() primitives.
+    """
+    args = node.args
+    if node.oper == "distance":
+        A = np.array(args[0:3], dtype=object)
+        B = np.array(args[3:6], dtype=object)
+        # distance() primitive uses defined endpoints, but user may
+        # write either norm(A-B) or norm(B-A), so try both
+        return {expr_signature(norm(A - B)), expr_signature(norm(B - A))}
+
+    if node.oper == "angle":
+        A = np.array(args[0:3], dtype=object)
+        B = np.array(args[3:6], dtype=object)
+        C = np.array(args[6:9], dtype=object)
+
+        def expanded(P, Q, R):
+            u = P - Q
+            v = R - Q
+            return np.arccos(dot(u, v) / (norm(u) * norm(v)))
+
+        # angle() primitive uses defined ordering of the two outer atoms,
+        # so try both representations to match user's convention
+        return {expr_signature(expanded(A, B, C)), expr_signature(expanded(C, B, A))}
+
+    return set()
+
+
+def add_user_geometry_aliases(q_expr, q_bindings):
+    """Bind atomic distance or angle nodes to equivalent user-defined nodes.
+
+    This is on purpose made local to vibrational derivative evaluation.
+    It does not affect reverse AD, the geometry cache, or the rotational-frame path.
+    """
+    sig_to_sop = {expr_signature(qnode): q_bindings[qnode.id] for qnode in q_expr}
+
+    out = dict(q_bindings)
+
+    for node in tuple(_geom_cache.values()):
+        if node.oper not in ("distance", "angle"):
+            continue
+
+        if node.id in out or ("sig", expr_signature(node)) in out:
+            continue
+
+        for sig in geom_expanded_signatures(node):
+            q_sop = sig_to_sop.get(sig)
+
+            if q_sop is not None:
+                out[node.id] = q_sop
+                out[("sig", expr_signature(node))] = q_sop
+                break
+
+    return out
 
 
 def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
@@ -50,6 +113,9 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
         out = eval(args[0]) * eval(args[1])
     elif oper == "div":
         out = eval(args[0]) / eval(args[1])
+    elif oper == "regular_div":
+        # analytical quotient (e.g. a unit plane normal).
+        out = eval(args[0]) * sop_reciprocal(eval(args[1]), tol=1e-12, trace_kinds=())
     elif oper == "pow":
         p = root.data
         out = eval(args[0]) ** p
@@ -227,6 +293,12 @@ class Gmat:
             # graph for derivative dq_icoo / dx
             deriv = reverse_derivatives(root)
 
+            # reverse rules for dihedral can introduce atomic distance()
+            # and angle() factors, so if the user defined the same coordinates
+            # using norm(), dot(), or arccos(), we need to add temporary structural
+            # aliases to the corresponding one-dimensional q SOPs
+            local_q_bindings = add_user_geometry_aliases(q_expr, q_bindings)
+
             for i in range(self.natoms):
                 for ialpha, alpha in enumerate(("x", "y", "z")):
 
@@ -237,7 +309,7 @@ class Gmat:
                         deriv.get(f"{alpha}{i}", as_expr(0)),
                         xyz_bindings,
                         self.grids,
-                        q_bindings,
+                        local_q_bindings,
                     )
 
         return svec
@@ -283,6 +355,35 @@ class Gmat:
 
                     # terms with the same protected analytical prefactor may still cancel
                     # even when their 1D arrays differ only by an overall scalar or sign
+                    #
+                    # collect_final_terms() can detect a removable protected factor only
+                    # after several SOP terms have been combined
+                    #
+                    # so, run protected-factor normalization again after collection
+                    # and iterate because cancelling one protected power can enable
+                    # another exact collection or cancellation
+
+                    prev_state = None
+                    for _ in range(4):
+                        g = g.collect_final_terms(
+                            zero_tol=self.compress_zero_tol,
+                            identity_tol=max(self.compress_identity_tol, 1e-12),
+                        )
+                        g = g.normalize_protected_factors(
+                            tol=max(self.compress_identity_tol, 1e-10),
+                            coordinates=self.singularity_coo,
+                            kinds=self.singularity_kinds,
+                        ).compress_hashed(
+                            zero_tol=self.compress_zero_tol,
+                            identity_tol=self.compress_identity_tol,
+                        )
+
+                        state = (g.nterms, tuple(g.protected))
+                        if state == prev_state:
+                            break
+                        prev_state = state
+
+                    # final collection after the last normalization
                     g = g.collect_final_terms(
                         zero_tol=self.compress_zero_tol,
                         identity_tol=max(self.compress_identity_tol, 1e-12),
@@ -1009,6 +1110,359 @@ class Gmat:
                 grr[b, a] = grr[a, b]
 
         return gvv, grv, grr
+
+    @staticmethod
+    def fdf_weights(x0, x, order):
+        """Finite-difference weights for d**order/dx**order at x0"""
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        dx = x - float(x0)
+        A = np.vstack([dx**k for k in range(n)])
+        b = np.zeros(n, dtype=float)
+        b[order] = float(math.factorial(order))
+        return np.linalg.solve(A, b)
+
+    def fdf_augmented_grids(self, stencil=5, fdf_step=1.0e-3):
+        """Augment every user grid point by local finite-difference points"""
+        if stencil < 3 or stencil % 2 == 0:
+            raise ValueError("stencil must be an odd integer >= 3")
+
+        ncoo = len(self.grids)
+        steps = np.asarray(fdf_step, dtype=float)
+        if steps.ndim == 0:
+            steps = np.full(ncoo, float(steps), dtype=float)
+        else:
+            steps = steps.ravel()
+            if len(steps) != ncoo:
+                raise ValueError(
+                    "fdf_step must be a scalar or have one value per coordinate"
+                )
+        if np.any(~np.isfinite(steps)) or np.any(steps <= 0.0):
+            raise ValueError("all fdf_step values must be finite and positive")
+
+        radius = stencil // 2
+        aug_grids = []
+        info = []
+        for icoo, g in enumerate(self.grids):
+            g = np.asarray(g, dtype=float)
+
+            if g.ndim != 1 or len(g) < 1:
+                raise ValueError(
+                    "each user grid must be a non-empty one-dimensional array"
+                )
+
+            if len(g) > 1 and np.any(np.diff(g) <= 0.0):
+                raise ValueError("user grids must be strictly increasing")
+
+            hs = np.full(len(g), steps[icoo], dtype=float)
+            pts = list(g)
+            stencils = []
+
+            for x0, h in zip(g, hs):
+                xs = x0 + h * np.arange(-radius, radius + 1, dtype=float)
+
+                pts.extend(xs.tolist())
+                stencils.append(xs)
+
+            aug = np.unique(np.asarray(pts))
+            aug.sort()
+
+            ci = []
+            for x0, xs in zip(g, stencils):
+                inds = np.array([int(np.argmin(np.abs(aug - x))) for x in xs])
+
+                ci.append(
+                    (
+                        inds,
+                        self.fdf_weights(x0, aug[inds], 1),
+                        self.fdf_weights(x0, aug[inds], 2),
+                    )
+                )
+
+            orig = np.array([int(np.argmin(np.abs(aug - x))) for x in g])
+
+            aug_grids.append(aug)
+            info.append({"points": ci, "orig_inds": orig})
+
+        return aug_grids, info
+
+    @staticmethod
+    def protected_1d_values(q, factors, order):
+        """Analytical derivative of P(q)=prod base(q)**power, order 0..2."""
+        q = np.asarray(q, dtype=float)
+        P = np.ones_like(q)
+        L = np.zeros_like(q)
+        Lp = np.zeros_like(q)
+
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            for kind, power in factors:
+                p = float(power)
+                if kind == "q":
+                    base = q
+                    P *= base**p
+                    L += p / q
+                    Lp += -p / (q * q)
+                elif kind == "sin":
+                    s, c = np.sin(q), np.cos(q)
+                    P *= s**p
+                    L += p * c / s
+                    Lp += -p / (s * s)
+                elif kind == "cos":
+                    c, s = np.cos(q), np.sin(q)
+                    P *= c**p
+                    L += -p * s / c
+                    Lp += -p / (c * c)
+                else:
+                    raise ValueError(f"unknown protected factor kind {kind}")
+
+            if order == 0:
+                return P
+            if order == 1:
+                return P * L
+            if order == 2:
+                return P * (L * L + Lp)
+
+        raise ValueError("protected derivative order must be 0, 1, or 2")
+
+    def fdf_sop_protected(self, sop, fdf_info, deriv_orders=None):
+        """Differentiate an SOP while analytically differentiating protected factors"""
+        if deriv_orders is None:
+            deriv_orders = [0] * self.ncoo
+
+        if len(deriv_orders) != self.ncoo:
+            raise ValueError("deriv_orders has wrong length")
+
+        terms = []
+        sigs = []
+
+        for term, sig in zip(sop.terms, sop.protected):
+            bycoord = {k: [] for k in range(self.ncoo)}
+
+            for k, kind, power in sig:
+                bycoord[int(k)].append((str(kind), float(power)))
+
+            newterm = []
+            newsig = []
+
+            for k, factor in enumerate(term):
+                factor = np.asarray(factor, dtype=float)
+                order = int(deriv_orders[k])
+                ci = fdf_info[k]
+                f0 = factor[ci["orig_inds"]]
+                pf = bycoord[k]
+
+                if order == 0:
+                    vals = f0
+                    newsig.extend((k, kind, power) for kind, power in pf)
+
+                elif order in (1, 2):
+                    f1 = np.empty(len(self.grids[k]))
+                    f2 = np.empty(len(self.grids[k])) if order == 2 else None
+
+                    for j, (inds, w1, w2) in enumerate(ci["points"]):
+                        f1[j] = np.dot(w1, factor[inds])
+                        if order == 2:
+                            f2[j] = np.dot(w2, factor[inds])
+
+                    if pf:
+                        q = self.grids[k]
+                        P0 = self.protected_1d_values(q, pf, 0)
+                        P1 = self.protected_1d_values(q, pf, 1)
+
+                        if order == 1:
+                            vals = f1 * P0 + f0 * P1
+                        else:
+                            P2 = self.protected_1d_values(q, pf, 2)
+                            vals = f2 * P0 + 2.0 * f1 * P1 + f0 * P2
+
+                    else:
+                        vals = f1 if order == 1 else f2
+
+                else:
+                    raise ValueError("only derivative orders 0, 1, and 2 are supported")
+
+                newterm.append(vals)
+
+            terms.append(newterm)
+
+            sigs.append(tuple(newsig))
+
+        return SumProd(terms, protected=sigs, grids=self.grids)
+
+    def fdf_add(self, acc, value):
+        out = acc + value
+        if out.nterms >= self.compress_nterms_thresh:
+            out = out.compress(
+                tol=self.compress_tol,
+                zero_tol=self.compress_zero_tol,
+                identity_tol=self.compress_identity_tol,
+            )
+        return out
+
+    def finalize_pseudopotential(self, U):
+        U = U.compress(
+            tol=self.compress_tol,
+            zero_tol=self.compress_zero_tol,
+            identity_tol=self.compress_identity_tol,
+        )
+
+        if self.trace_singularities:
+            U = U.normalize_protected_factors(
+                tol=max(self.compress_identity_tol, 1e-10),
+                coordinates=self.singularity_coo,
+                kinds=self.singularity_kinds,
+            ).compress_hashed(
+                zero_tol=self.compress_zero_tol, identity_tol=self.compress_identity_tol
+            )
+
+            U = U.collect_final_terms(
+                zero_tol=self.compress_zero_tol,
+                identity_tol=max(self.compress_identity_tol, 1e-12),
+            )
+
+            # e.g. (a + b*sin(q)**2)/sin(q)**2 -> a/sin(q)**2 + b
+            U = U.split_protected_even_remainder(
+                tol=max(self.compress_identity_tol, 1e-10)
+            ).compress_hashed(
+                zero_tol=self.compress_zero_tol,
+                identity_tol=self.compress_identity_tol,
+            )
+
+            U = U.collect_final_terms(
+                zero_tol=self.compress_zero_tol,
+                identity_tol=max(self.compress_identity_tol, 1e-12),
+            )
+
+            # absorb only odd sin/cos poles into the regular numerator, then recompress
+            U = U.absorb_selected_protected(
+                lambda k, kind, p: kind in ("sin", "cos")
+                and p < 0.0
+                and int(round(abs(p))) % 2 == 1
+            )
+
+            U = U.compress_hashed(
+                zero_tol=self.compress_zero_tol, identity_tol=self.compress_identity_tol
+            )
+
+            U = U.collect_final_terms(
+                zero_tol=self.compress_zero_tol,
+                identity_tol=max(self.compress_identity_tol, 1e-12),
+            )
+
+        return U
+
+    def build_pseudopotential_fdf(self, stencil=5, fdf_step=1.0e-4):
+        """Build pseudopotential with analytical protected-factor derivatives"""
+        aug_grids, fd_info = self.fdf_augmented_grids(stencil, fdf_step)
+
+        aug = Gmat(
+            aug_grids,
+            self.masses,
+            self.internal_to_cartesian,
+            self.cartesian_to_internal,
+            frame_conditions=self.frame_conditions,
+            compress_tol=self.compress_tol,
+            compress_zero_tol=self.compress_zero_tol,
+            compress_identity_tol=self.compress_identity_tol,
+            compress_nterms_thresh=self.compress_nterms_thresh,
+            nmode_order=None,
+            trace_singularities=self.trace_singularities,
+            singularity_coo=self.singularity_coo,
+            singularity_kinds=self.singularity_kinds,
+        )
+
+        _, _, _, aux = aug.run(return_rot=True, return_svec=True)
+        svib_a, srot_a = aux["svib"], aux["srot"]
+
+        zord = [0] * self.ncoo
+        svib = np.empty_like(svib_a)
+        srot = np.empty_like(srot_a)
+
+        for n in range(self.ncoo):
+            for i in range(self.natoms):
+                for a in range(3):
+                    svib[n, i, a] = self.fdf_sop_protected(
+                        svib_a[n, i, a], fd_info, zord
+                    )
+
+        for b in range(3):
+            for i in range(self.natoms):
+                for a in range(3):
+                    srot[b, i, a] = self.fdf_sop_protected(
+                        srot_a[b, i, a], fd_info, zord
+                    )
+
+        eps_terms = (
+            (0, 1, 2, 1.0),
+            (1, 2, 0, 1.0),
+            (2, 0, 1, 1.0),
+            (0, 2, 1, -1.0),
+            (2, 1, 0, -1.0),
+            (1, 0, 2, -1.0),
+        )
+
+        zero = SumProd.constant(0.0, self.grids)
+        U = zero
+        dsv_diag = {}
+        dsrot = {}
+        d2sv = {}
+
+        for i, mass in enumerate(self.masses):
+            mass = float(mass)
+            term1 = zero
+            for alpha in range(3):
+                w = zero
+                for aa, beta, gamma, sign in eps_terms:
+                    if aa == alpha:
+                        w = self.fdf_add(w, sign * srot[beta, i, gamma])
+                term1 = self.fdf_add(term1, 0.5 * w * w)
+
+            term2 = zero
+            for alpha, beta, gamma, sign in eps_terms:
+                for n in range(self.ncoo):
+                    key = (beta, i, alpha, n)
+                    if key not in dsrot:
+                        o = [0] * self.ncoo
+                        o[n] = 1
+                        dsrot[key] = self.fdf_sop_protected(
+                            srot_a[beta, i, alpha], fd_info, o
+                        )
+                    term2 = self.fdf_add(term2, sign * svib[n, i, gamma] * dsrot[key])
+
+            term3 = zero
+            for alpha in range(3):
+                for n in range(self.ncoo):
+                    for m in range(self.ncoo):
+                        key = (m, i, alpha, n, m)
+                        if key not in d2sv:
+                            o = [0] * self.ncoo
+                            if n == m:
+                                o[n] = 2
+                            else:
+                                o[n] = 1
+                                o[m] = 1
+                            d2sv[key] = self.fdf_sop_protected(
+                                svib_a[m, i, alpha], fd_info, o
+                            )
+                        term3 = self.fdf_add(term3, svib[n, i, alpha] * d2sv[key])
+
+            term4 = zero
+            for alpha in range(3):
+                divs = zero
+                for n in range(self.ncoo):
+                    key = (n, i, alpha)
+                    if key not in dsv_diag:
+                        o = [0] * self.ncoo
+                        o[n] = 1
+                        dsv_diag[key] = self.fdf_sop_protected(
+                            svib_a[n, i, alpha], fd_info, o
+                        )
+                    divs = self.fdf_add(divs, dsv_diag[key])
+                term4 = self.fdf_add(term4, 0.5 * divs * divs)
+
+            U = self.fdf_add(U, (0.25 / mass) * (term1 + term2 - term3 - term4))
+
+        return self.finalize_pseudopotential(U)
 
     def run(self, return_rot=False, return_svec=False):
         """Build SOP G matrices"""
