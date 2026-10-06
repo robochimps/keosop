@@ -4,7 +4,7 @@ Python package for constructing exact molecular rovibrational kinetic-energy ope
 
 The method requires the user to provide internal-to-Cartesian and Cartesian-to-internal coordinate transformations, together with a one-dimensional grid for each internal coordinate $q_k$ ($k=1,\ldots,M$), where $M=3N-6$ for a nonlinear molecule with $N$ atoms.
 
-The elements of the $G$-matrix are constructed directly in SOP form,
+The elements of the KEO $G$-matrix and pseudopotential are constructed directly in SOP form,
 
 $$
 G_{\lambda\mu}(q_1,\ldots,q_M) = \sum_{t=1}^{N_t} g_{t,\lambda\mu}^{(1)}(q_1) \cdots g_{t,\lambda\mu}^{(M)}(q_M),
@@ -15,15 +15,17 @@ These factors are generated automatically by propagating SOP objects through the
 The full multi-dimensional direct-product grid is never constructed.
 
 For the rotational and rovibrational contributions to the $G$-matrix, KEOSOP follows the approach of Sørensen [G. O. Sørensen, "A new approach to the Hamiltonian of nonrigid molecules" (1979). In: Large Amplitude Motion in Molecules II. Topics in Current Chemistry, vol 82, https://doi.org/10.1007/BFb0048009].
-This formulation requires three conditions, expressed in terms of the Cartesian coordinates, that uniquely fix the orientation of the body-fixed molecular frame.
+This formulation requires three conditions, expressed in terms of the Cartesian coordinates of atoms, that uniquely define the orientation of the body-fixed molecular frame.
 For example, such conditions may say that a particular atom lies in the $xz$ plane or that a particular bond is aligned with the $z$ axis, or more generally, define an Eckart frame.
 
-KEOSOP includes an experimental procedure for automatically inferring suitable body-frame conditions from the user-supplied internal-to-Cartesian transformation.
+KEOSOP includes an experimental procedure for automatically inferring body-frame conditions from the user-supplied internal-to-Cartesian transformation function.
 The procedure searches for linear and quadratic relations among the Cartesian coordinates that are identically satisfied over the molecular geometries represented by the coordinate grids.
-Automatic selection of body-fixed frames that respect molecular symmetry is not yet implemented (see T. Mellor, *Mol. Phys.* **120** (2023) e2118638, https://doi.org/10.1080/00268976.2022.2118638).
+Automatic selection of body-fixed frames that respect molecular symmetry is yet to be implemented (see, e.g., T. Mellor, *Mol. Phys.* **120** (2023) e2118638, https://doi.org/10.1080/00268976.2022.2118638).
 
-The construction of the rotational contribution involves the inversion of a $3\times3$ geometry-dependent matrix, which may not, in general, possess an exact finite SOP representation.
-This remains a potential limitation for the fully automatic construction of the rotational and rovibrational parts of the KEO. 
+The construction of the rotational contribution requires the inversion of a geometry-dependent $3\times3$ matrix.
+In general, the resulting inverse may not possess an exact finite SOP representation.
+Furthermore, the internal-to-Cartesian coordinate transformation may introduce nonseparable coordinate dependencies.
+This represents a potential limitation of the fully automatic construction of the KEO in SOP form.
 
 Installation
 -----
@@ -126,8 +128,8 @@ save_gmat_hdf5(
 
 grids, gvib, grovib, grot, pseudo = load_gmat_hdf5(filename)
 ```
-
-Sum-of-products representation of the kinetic energy operator ($G$-matrix and pseudopotential) for formaldehyde ($\mathrm{H_2CO}$) molecule, expressed in terms of Z-matrix coordinates:
+-----
+Sum-of-products representation of the kinetic energy operator ($G$-matrix and pseudopotential) for formaldehyde ($\mathrm{H_2CO}$) molecule, expressed in terms of the standard Z-matrix coordinates:
 ```py
 import numpy as np
 
