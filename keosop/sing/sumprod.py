@@ -171,6 +171,147 @@ class SumProd:
 
         return SumProd(new_terms, protected=new_sigs, grids=self.grids)
 
+    def absorb_selected_protected(self, predicate):
+        """Move selected protected factors exactly into their numerical 1D arrays"""
+        if self.grids is None:
+            return self.copy()
+
+        terms = []
+        sigs = []
+
+        for term, sig in zip(self.terms, self.protected):
+            fs = [np.asarray(f, dtype=float).copy() for f in term]
+
+            keep = []
+
+            for k, kind, power in sig:
+                if predicate(int(k), str(kind), float(power)):
+                    q = self.grids[int(k)]
+                    base = (
+                        q if kind == "q" else np.sin(q) if kind == "sin" else np.cos(q)
+                    )
+
+                    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                        fs[int(k)] *= base ** float(power)
+
+                else:
+                    keep.append((k, kind, power))
+
+            terms.append(fs)
+            sigs.append(self.protected_signature(keep))
+
+        return SumProd(terms, protected=sigs, grids=self.grids)
+
+    def split_protected_even_remainder(self, tol=1e-10, max_degree=6):
+        """For a protected factor `base(q)^(-2m)` on coordinate k, try to write
+        the numerical 1D factor on that same coordinate as a low-degree polynomial
+        in `x = base(q)^2`:
+
+            f(q) = a0 + a1*x + ... + ad*x**d
+
+        The terms a_j*x**j with j < m remain protected with pole order
+        `-2*(m-j)`, terms with j >= m are regular and are moved completely
+        into the numerical factor
+        """
+        if self.grids is None:
+            return self.copy()
+
+        out_terms = []
+        out_sigs = []
+
+        for term, sig0 in zip(self.terms, self.protected):
+            pieces = [([np.asarray(f, dtype=float).copy() for f in term], list(sig0))]
+
+            # consider only negative even integer powers
+            for k, kind, power in sig0:
+                k = int(k)
+                power = float(power)
+                n = int(round(-power))
+
+                if kind not in ("q", "sin", "cos") or power >= 0.0 or n < 2 or n % 2:
+                    continue
+
+                if abs(power + n) > 1e-12:
+                    continue
+
+                m = n // 2
+                q = np.asarray(self.grids[k], dtype=float)
+                base = q if kind == "q" else np.sin(q) if kind == "sin" else np.cos(q)
+                x = base * base
+
+                newpieces = []
+
+                for fs, sig in pieces:
+                    cur = None
+                    for ii, (kk, kd, pp) in enumerate(sig):
+                        if (
+                            int(kk) == k
+                            and kd == kind
+                            and abs(float(pp) - power) < 1e-12
+                        ):
+                            cur = ii
+                            break
+
+                    if cur is None:
+                        newpieces.append((fs, sig))
+                        continue
+
+                    y = np.asarray(fs[k], dtype=float)
+                    if len(y) < 2:
+                        newpieces.append((fs, sig))
+                        continue
+
+                    degmax = min(int(max_degree), len(y) - 1)
+                    coeff = None
+                    scale = max(1.0, float(np.max(np.abs(y))))
+
+                    for deg in range(degmax + 1):
+                        V = np.vander(x, N=deg + 1, increasing=True)
+                        c, *_ = np.linalg.lstsq(V, y, rcond=None)
+                        err = float(np.max(np.abs(V @ c - y)))
+
+                        if err <= tol * scale:
+                            coeff = c
+                            break
+
+                    if coeff is None:
+                        newpieces.append((fs, sig))
+                        continue
+
+                    # replace this one SOP term by the polynomial pieces,
+                    # the scalar polynomial coefficient is put on coordinate k
+                    sig_without = sig[:cur] + sig[cur + 1 :]
+
+                    for j, a in enumerate(coeff):
+                        if abs(float(a)) <= tol * scale:
+                            continue
+
+                        fsj = [f.copy() for f in fs]
+
+                        if j < m:
+                            fsj[k] = np.full_like(y, float(a))
+                            ps = -2.0 * (m - j)
+                            sigj = self.protected_signature(
+                                tuple(sig_without) + ((k, kind, ps),)
+                            )
+
+                        else:
+                            fsj[k] = float(a) * (x ** (j - m))
+                            sigj = self.protected_signature(tuple(sig_without))
+
+                        newpieces.append((fsj, list(sigj)))
+
+                pieces = newpieces
+
+            for fs, sig in pieces:
+                out_terms.append(fs)
+                out_sigs.append(self.protected_signature(sig))
+
+        if not out_terms:
+            return self.copy()
+
+        return SumProd(out_terms, protected=out_sigs, grids=self.grids)
+
     @property
     def npoints(self):
         return tuple(len(f) for f in self.terms[0])
