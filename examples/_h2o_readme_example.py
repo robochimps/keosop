@@ -1,10 +1,10 @@
 import numpy as np
+
 from keosop.gmat import Gmat
+from keosop.hdf5 import load_gmat_hdf5, save_gmat_hdf5
 from keosop.revad import dot, norm
 
 masses = np.array([15.99491463, 1.00782505, 1.00782505])  # masses of O, H, H atoms
-
-ncoo = 3
 
 
 # User-supplied function for computing Cartesian coordinates from internal valence coordinates
@@ -36,16 +36,22 @@ def cartesian_to_internal(xyz):
 
 # User-supplied one-dimensional grids for each internal coordinate
 # on which sum-of-products representation will be built
+
 rad = np.pi / 180
 grids = [
-    np.linspace(0.8, 2.0, 10000),  # r1
-    np.linspace(0.8, 2.0, 10000),  # r2
-    np.linspace(30 * rad, 170 * rad, 10000),  # alpha
+    np.linspace(0.8, 3.0, 1000),  # r1
+    np.linspace(0.8, 3.0, 1000),  # r2
+    np.linspace(30 * rad, 170 * rad, 1000),  # alpha
 ]
 
-# Generate Gvib, Grot, and Grovib in sum-of-products form
+ncoo = len(grids)
+
+# Generate G-matrix and pseudopotential in sum-of-products form
+
 gmat = Gmat(grids, masses, internal_to_cartesian, cartesian_to_internal)
+
 gvib_sop, grovib_sop, grot_sop = gmat.run(return_rot=True)
+pseudo_sop = gmat.build_pseudopotential_fdf()
 
 print("Number of terms in Gvib_{i,j}\n i  j no.terms")
 for i in range(ncoo):
@@ -61,3 +67,24 @@ print("\nNumber of terms in Grot_{i,j}\n i  j no.terms")
 for i in range(3):
     for j in range(i, 3):
         print(f"{i:2d} {j:2d} {grot_sop[i, j].nterms:6d}")
+
+print(f"\nNumber of terms in pseudopotential: {pseudo_sop.nterms:6d}")
+
+# Store data in file
+
+filename = "keo_h2o.h5"
+
+save_gmat_hdf5(
+    filename,
+    grids,
+    gvib_sop,
+    grovib_sop,
+    grot_sop,
+    pseudo_sop,
+    coo_names=("r1", "r2", "alpha"),
+    coo_units=("angs", "angs", "rad"),
+)
+
+# Load data from file
+
+grids, gvib, grovib, grot, pseudo = load_gmat_hdf5(filename)
