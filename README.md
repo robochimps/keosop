@@ -1,10 +1,14 @@
 # KEOSOP
 
-Python package for constructing exact molecular rovibrational kinetic-energy operators (KEO) in sum-of-products (SOP) form.
+KEOSOP is a Python package for constructing molecular rovibrational kinetic-energy operators (KEOs) directly in numerical sum-of-products (SOP) form, retaining the accuracy of symbolic derivation without Taylor expansions or multidimensional fitting.
+
+## Overview
 
 The method requires the user to provide internal-to-Cartesian and Cartesian-to-internal coordinate transformations, together with a one-dimensional grid for each internal coordinate $q_k$ ($k=1,\ldots,M$), where $M=3N-6$ for a nonlinear molecule with $N$ atoms.
+Molecular coordinates can also be specified using a standard Z-matrix.
 
-The elements of the KEO $G$-matrix and pseudopotential are constructed directly in SOP form,
+The elements of the KEO $G$-matrix and pseudopotential are constructed directly in SOP form.
+For example,
 
 $$
 G_{\lambda\mu}(q_1,\ldots,q_M) = \sum_{t=1}^{N_t} g_{t,\lambda\mu}^{(1)}(q_1) \cdots g_{t,\lambda\mu}^{(M)}(q_M),
@@ -14,18 +18,24 @@ where each one-dimensional factor $g_{t,\lambda\mu}^{(k)}(q_k)$ is represented n
 These factors are generated automatically by propagating SOP objects through the computational graphs defining the coordinate transformations.
 The full multi-dimensional direct-product grid is never constructed.
 
+## Body-fixed frame
+
 For the rotational and rovibrational contributions to the $G$-matrix, KEOSOP follows the approach of Sørensen [G. O. Sørensen, "A new approach to the Hamiltonian of nonrigid molecules" (1979). In: Large Amplitude Motion in Molecules II. Topics in Current Chemistry, vol 82, https://doi.org/10.1007/BFb0048009].
-This formulation requires three conditions, expressed in terms of the Cartesian coordinates of atoms, that uniquely define the orientation of the body-fixed molecular frame.
-For example, such conditions may say that a particular atom lies in the $xz$ plane or that a particular bond is aligned with the $z$ axis, or more generally, define an Eckart frame.
+This formulation requires three independent constraints on the atomic Cartesian coordinates to define the orientation of the body-fixed molecular frame.
+For example, these constraints may specify that a particular atom lies in the $xz$ plane, that a particular bond is aligned with the $z$ axis, or more generally, that the molecular geometry satisfies Eckart conditions.
 
-KEOSOP includes an experimental procedure for automatically inferring body-frame conditions from the user-supplied internal-to-Cartesian transformation function.
-The procedure searches for linear and quadratic relations among the Cartesian coordinates that are identically satisfied over the molecular geometries represented by the coordinate grids.
-Automatic selection of body-fixed frames that respect molecular symmetry is yet to be implemented (see, e.g., T. Mellor, *Mol. Phys.* **120** (2023) e2118638, https://doi.org/10.1080/00268976.2022.2118638).
+KEOSOP provides a procedure for automatically inferring body-frame constraints from the user-supplied internal-to-Cartesian transformation.
+The procedure identifies linear and quadratic relations among Cartesian coordinates that are identically satisfied over the molecular geometries defined by the coordinate grids.
+Automatic selection of body-fixed frames that respect molecular symmetry is not yet implemented (see, e.g., T. Mellor, *Mol. Phys.* **120** (2023) e2118638, https://doi.org/10.1080/00268976.2022.2118638).
 
-The construction of the rotational contribution requires the inversion of a geometry-dependent $3\times3$ matrix.
-In general, the resulting inverse may not possess an exact finite SOP representation.
-Furthermore, the internal-to-Cartesian coordinate transformation may introduce nonseparable coordinate dependencies.
-This represents a potential limitation of the fully automatic construction of the KEO in SOP form.
+## Limitations and future development
+
+The construction of the rotational contribution requires inversion of a geometry-dependent $3\times3$ matrix, whose inverse does not necessarily admit an exact finite SOP representation.
+Similarly, the internal-to-Cartesian transformations may introduce nonseparable coordinate dependencies that cannot be represented iby the current exact SOP algebra.
+
+These cases limit the applicability of fully automatic SOP construction.
+A planned extension is to incorporate numerical low-rank decomposition methods as a fallback when intermediate expressions cannot be represented exactly in SOP form.
+Such decompositions would operate within the computational backend, preserving exact SOP operations wherever possible while allowing approximate representations of otherwise nonseparable intermediate quantities.
 
 Installation
 -----
