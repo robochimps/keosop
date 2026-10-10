@@ -1351,7 +1351,7 @@ class Gmat:
 
         return U
 
-    def build_pseudopotential_fdf(self, stencil=5, fdf_step=1.0e-4):
+    def build_pseudopotential_fdf(self, stencil=5, fdf_step=1.0e-3):
         """Build pseudopotential with analytical protected-factor derivatives"""
         aug_grids, fd_info = self.fdf_augmented_grids(stencil, fdf_step)
 
