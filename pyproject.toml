@@ -7,10 +7,19 @@ name = "keosop"
 version = "0.1.0"
 description = "Molecular rovibrational kinetic energy operators in sum-of-products form"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Robochimps", email = "andrey.yachmenev@robochimps.com" }]
-dependencies = ["jax>=0.5.3", "numpy>=2.2.4", "scipy>=1.15.2"]
+dependencies = [
+    "h5py>=3.11.0",
+    "ipykernel",
+    "jax>=0.5.3",
+    "jupyterlab",
+    "matplotlib",
+    "numpy>=2.2.4",
+    "scipy>=1.15.2",
+    "seaborn",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
