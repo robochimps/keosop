@@ -1,228 +1,310 @@
 # KEOSOP
 
-KEOSOP is a Python package for constructing molecular rovibrational kinetic-energy operators (KEOs) directly in numerical sum-of-products (SOP) form, retaining the accuracy of symbolic derivation without Taylor expansions or multidimensional fitting.
+KEOSOP constructs molecular rovibrational kinetic-energy operators (KEOs) directly in numerical sum-of-products (SOP) form from curvilinear coordinate transformations.
+It combines reverse-mode automatic differentiation with SOP arithmetic, without first deriving a complete symbolic KEO or fitting it on a multidimensional grid.
 
-## Overview
+The package computes the vibrational, rovibrational, and rotational $G$-matrix blocks, together with an optional pseudopotential.
 
-The method requires the user to provide internal-to-Cartesian and Cartesian-to-internal coordinate transformations, together with a one-dimensional grid for each internal coordinate $q_k$ ($k=1,\ldots,M$), where $M=3N-6$ for a nonlinear molecule with $N$ atoms.
-Molecular coordinates can also be specified using a standard Z-matrix.
+## Installation
 
-The elements of the KEO $G$-matrix and pseudopotential are constructed directly in SOP form.
-For example,
-
-$$
-G_{\lambda\mu}(q_1,\ldots,q_M) = \sum_{t=1}^{N_t} g_{t,\lambda\mu}^{(1)}(q_1) \cdots g_{t,\lambda\mu}^{(M)}(q_M),
-$$
-
-where each one-dimensional factor $g_{t,\lambda\mu}^{(k)}(q_k)$ is represented numerically by its values on the corresponding one-dimensional grid rather than by an explicit analytical expression.
-These factors are generated automatically by propagating SOP objects through the computational graphs defining the coordinate transformations.
-The full multi-dimensional direct-product grid is never constructed.
-
-## Body-fixed frame
-
-For the rotational and rovibrational contributions to the $G$-matrix, KEOSOP follows the approach of Sørensen [G. O. Sørensen, "A new approach to the Hamiltonian of nonrigid molecules" (1979). In: Large Amplitude Motion in Molecules II. Topics in Current Chemistry, vol 82, https://doi.org/10.1007/BFb0048009].
-This formulation requires three independent constraints on the atomic Cartesian coordinates to define the orientation of the body-fixed molecular frame.
-For example, these constraints may specify that a particular atom lies in the $xz$ plane, that a particular bond is aligned with the $z$ axis, or more generally, that the molecular geometry satisfies Eckart conditions.
-
-KEOSOP provides a procedure for automatically inferring body-frame constraints from the user-supplied internal-to-Cartesian transformation.
-The procedure identifies linear and quadratic relations among Cartesian coordinates that are identically satisfied over the molecular geometries defined by the coordinate grids.
-Automatic selection of body-fixed frames that respect molecular symmetry is not yet implemented (see, e.g., T. Mellor, *Mol. Phys.* **120** (2023) e2118638, https://doi.org/10.1080/00268976.2022.2118638).
-
-## Limitations and future development
-
-The construction of the rotational contribution requires inversion of a geometry-dependent $3\times3$ matrix, whose inverse does not necessarily admit an exact finite SOP representation.
-Similarly, the internal-to-Cartesian transformations may introduce nonseparable coordinate dependencies that cannot be represented iby the current exact SOP algebra.
-
-These cases limit the applicability of fully automatic SOP construction.
-A planned extension is to incorporate numerical low-rank decomposition methods as a fallback when intermediate expressions cannot be represented exactly in SOP form.
-Such decompositions would operate within the computational backend, preserving exact SOP operations wherever possible while allowing approximate representations of otherwise nonseparable intermediate quantities.
-
-Installation
------
+KEOSOP requires Python 3.12.11 or newer.
+For installation, use the command below:
 ```bash
-pip install --upgrade git+https://github.com/robochimps/keosop.git
+python -m pip install --upgrade git+https://github.com/robochimps/keosop.git
 ```
 
-Quick examples
------
-Sum-of-products representation of the kinetic energy operator ($G$-matrix and pseudopotential) for a triatomic molecule, expressed in terms of valence coordinates: two bond length $r_1$, $r_2$, and the bond angle $\alpha$:
-```py
+## Quick start: water in user-defined coordinates
+
+The following example uses two O-H bond lengths, `r1` and `r2`, and the H-O-H valence angle `alpha`, the O atom is placed at the origin, and the Cartesian $z$-axis is aligned along the H-O-H bisector:
+
+```python
 import numpy as np
 
 from keosop.gmat import Gmat
-from keosop.hdf5 import load_gmat_hdf5, save_gmat_hdf5
-from keosop.revad import dot, norm
+from keosop.revad import angle, distance
 
-masses = np.array([15.99491463, 1.00782505, 1.00782505])  # masses of O, H, H atoms
+# Atom order: O, H1, H2
+masses = np.array([15.99491463, 1.00782505, 1.00782505])
 
 
-# User-supplied function for computing Cartesian coordinates from internal valence coordinates
 def internal_to_cartesian(q):
-    r1, r2, a = q
+    r1, r2, alpha = q
     return np.array(
         [
             [0.0, 0.0, 0.0],
-            [r1 * np.sin(a / 2), 0.0, r1 * np.cos(a / 2)],
-            [-r2 * np.sin(a / 2), 0.0, r2 * np.cos(a / 2)],
+            [r1 * np.sin(alpha / 2), 0.0, r1 * np.cos(alpha / 2)],
+            [-r2 * np.sin(alpha / 2), 0.0, r2 * np.cos(alpha / 2)],
         ],
         dtype=object,
     )
 
 
-# User-supplied function for computing internal valence coordinates from Cartesian coordinates
 def cartesian_to_internal(xyz):
-    C, H1, H2 = xyz
-
-    CH1 = H1 - C
-    CH2 = H2 - C
-
-    r1 = norm(CH1)
-    r2 = norm(CH2)
-    a = np.arccos(dot(CH1, CH2) / (r1 * r2))
-
-    return np.array([r1, r2, a], dtype=object)
+    O, H1, H2 = xyz
+    return np.array(
+        [distance(O, H1), distance(O, H2), angle(H1, O, H2)],
+        dtype=object,
+    )
 
 
-# User-supplied one-dimensional grids for each internal coordinate
-# on which sum-of-products representation will be built
-
-rad = np.pi / 180
+# Coordinate order: r1, r2, alpha
 grids = [
-    np.linspace(0.8, 3.0, 1000),  # r1
-    np.linspace(0.8, 3.0, 1000),  # r2
-    np.linspace(30 * rad, 170 * rad, 1000),  # alpha
+    np.linspace(0.8, 1.4, 12),
+    np.linspace(0.8, 1.4, 12),
+    np.deg2rad(np.linspace(80.0, 140.0, 16)),
 ]
 
-ncoo = len(grids)
+g = Gmat(grids, masses, internal_to_cartesian, cartesian_to_internal)
+gvib, grovib, grot = g.run(return_rot=True)
+pseudo = g.build_pseudopotential_fdf(stencil=5, fdf_step=1e-3)
 
-# Generate G-matrix and pseudopotential in sum-of-products form
+print("Gvib shape:", gvib.shape)
+print("Grovib shape:", grovib.shape)
+print("Grot shape:", grot.shape)
+print("SOP terms in Gvib[0, 0]:", gvib[0, 0].nterms)
+print("SOP terms in U:", pseudo.nterms)
+```
 
-gmat = Gmat(grids, masses, internal_to_cartesian, cartesian_to_internal)
+The shape output for this three-coordinate example is:
 
-gvib_sop, grovib_sop, grot_sop = gmat.run(return_rot=True)
-pseudo_sop = gmat.build_pseudopotential_fdf()
+```text
+Gvib shape: (3, 3)
+Grovib shape: (3, 3)
+Grot shape: (3, 3)
+```
 
-print("Number of terms in Gvib_{i,j}\n i  j no.terms")
-for i in range(ncoo):
-    for j in range(i, ncoo):
-        print(f"{i:2d} {j:2d} {gvib_sop[i, j].nterms:6d}")
+The pseudopotential is constructed separately.
 
-print("\nNumber of terms in Grovib_{i,j}\n i  j no.terms")
-for i in range(3):
-    for j in range(ncoo):
-        print(f"{i:2d} {j:2d} {grovib_sop[i, j].nterms:6d}")
+## Inputs, outputs, and SOP factors
 
-print("\nNumber of terms in Grot_{i,j}\n i  j no.terms")
-for i in range(3):
-    for j in range(i, 3):
-        print(f"{i:2d} {j:2d} {grot_sop[i, j].nterms:6d}")
+For `N` atoms and `M` internal coordinates, the main inputs are:
 
-print(f"\nNumber of terms in pseudopotential: {pseudo_sop.nterms:6d}")
+| Input | Format | Meaning |
+| --- | --- | --- |
+| `grids` | Sequence of `M` one-dimensional arrays | One grid per coordinate, in the same order as both transformations. |
+| `masses` | Array of shape `(N,)` | Positive masses, in the same atom order as the Cartesian arrays. |
+| `internal_to_cartesian(q)` | Returns an object array of shape `(N, 3)` | Maps internal coordinates to Cartesian components ordered as `x, y, z`. During SOP construction, `q[k]` is an SOP object. |
+| `cartesian_to_internal(xyz)` | Returns `M` traced expressions | Defines the inverse coordinate map. During tracing, `xyz` contains `keosop.revad.Expr` objects, not ordinary floating-point values. |
+| `frame_conditions(xyz)` | Optional callable returning three expressions | Specifies the body-fixed frame explicitly. If omitted, compatible conditions are inferred from the Cartesian embedding. |
 
-# Store data in file
+Use scalar arithmetic, supported NumPy functions, and object arrays in the transformation callbacks. 
+Geometry helpers such as `distance`, `angle`, `dihedral`, `dot`, and `norm` are available from `keosop.revad`.
+Avoid casting traced objects to floats or introducing coordinate-dependent `if` statements.
 
-filename = "keo_h2o.h5"
+The two transformations must describe the same coordinates, atom ordering, and angular branches on the chosen domain.
+
+The outputs of `g.run(return_rot=True)` are object arrays:
+
+| Output | Shape | Meaning |
+| --- | --- | --- |
+| `gvib` | `(M, M)` | Vibrational block. |
+| `grovib` | `(3, M)` | Rovibrational block, where rows index body-fixed frame axes. |
+| `grot` | `(3, 3)` | Rotational block. |
+| `pseudo` | One SOP object | Pseudopotential returned by `build_pseudopotential_fdf()`. |
+
+With default arguments, `builder.run()` returns only `gvib`.
+
+An SOP element is represented as
+
+$$
+G_{\lambda\mu}(q_1,\ldots,q_M)
+= \sum_{t=1}^{N_t}\prod_{k=1}^{M}g^{(k)}_{t,\lambda\mu}(q_k).
+$$
+
+The one-dimensional factors are stored as arrays on user-defined `grids` rather than analytical formulas.
+For an SOP object `sop`, `sop.terms[t][k]` contains the values of factor for coordinate `k` in term `t` on `grids[k]`, and `sop.nterms` is the number of stored products.
+This term count is not necessarily the minimal tensor rank.
+
+For example, evaluate a regular SOP element at a tuple of grid indices:
+
+```python
+sop = gvib[0, 0]
+indices = tuple(len(grid) // 2 for grid in grids)
+value = sum(
+    np.prod([factor[indices[k]] for k, factor in enumerate(term)])
+    for term in sop.terms
+)
+print("Gvib[0, 0] at the selected grid point:", value)
+```
+
+## Saving and loading operators
+
+The following continues the water example:
+
+```python
+from keosop.hdf5 import load_gmat_hdf5, save_gmat_hdf5
 
 save_gmat_hdf5(
-    filename,
+    "keo_h2o.h5",
     grids,
-    gvib_sop,
-    grovib_sop,
-    grot_sop,
-    pseudo_sop,
+    gvib,
+    grovib,
+    grot,
+    pseudo,
     coo_names=("r1", "r2", "alpha"),
-    coo_units=("angs", "angs", "rad"),
+    coo_units=("angstrom", "angstrom", "rad"),
+    metadata={"molecule": "H2O"},
 )
 
-# Load data from file
+(
+    loaded_grids,
+    loaded_gvib,
+    loaded_grovib,
+    loaded_grot,
+    loaded_pseudo,
+    metadata,
+) = load_gmat_hdf5("keo_h2o.h5", return_metadata=True)
 
-grids, gvib, grovib, grot, pseudo = load_gmat_hdf5(filename)
+print("Loaded coordinates:", metadata["coo_names"])
 ```
------
-Sum-of-products representation of the kinetic energy operator ($G$-matrix and pseudopotential) for formaldehyde ($\mathrm{H_2CO}$) molecule, expressed in terms of the standard Z-matrix coordinates:
-```py
+
+HDF5 files contain the coordinate grids, numerical SOP factors, optional coordinate metadata, and protected-factor metadata when present.
+The default load result is `(grids, gvib, grovib, grot, pseudo)`, while `return_metadata=True` appends a metadata dictionary.
+Omitted operator blocks are returned as `None`.
+
+## Z-matrix coordinates
+
+A conventional Z-matrix provides both coordinate transformations.
+Here is a complete formaldehyde example:
+
+```python
 import numpy as np
 
 from keosop.gmat import Gmat
-from keosop.hdf5 import load_gmat_hdf5, save_gmat_hdf5
 from keosop.zmat import cartesian_to_internal, internal_to_cartesian
 
-# Define Z-matrix coordinates for H2CO
-
-masses = np.array([12.0, 15.99491463, 1.00782505, 1.00782505])  # masses of C, O, H, H
-
+# Atom order: C, O, H1, H2
+zmat_masses = np.array([12.0, 15.99491463, 1.00782505, 1.00782505])
 zmat_connections = [
     (0, 0, 0, 0),  # C
-    (1, 0, 0, 0),  # O  - C
-    (1, 2, 0, 0),  # H1 - C - O
-    (1, 2, 3, 0),  # H2 - C - O - H1
+    (1, 0, 0, 0),  # C-O
+    (1, 2, 0, 0),  # H1-C-O
+    (1, 2, 3, 0),  # H2-C-O-H1
 ]
 
-
-# Define one-dimensional grids for the internal coordinate representation
-# and construct the G-matrix and pseudopotential in sum-of-products form
-
-rad = np.pi / 180
-
-# Define one-dimensional grids for each coordinate
-grids = [
-    np.linspace(0.8, 3.0, 1000),  # r_{CO}
-    np.linspace(0.8, 3.0, 1000),  # r_{CH1}
-    np.linspace(0.8, 3.0, 1000),  # r_{CH2}
-    np.linspace(30 * rad, 170 * rad, 1000),  # alpha_{H1CO}
-    np.linspace(30 * rad, 170 * rad, 1000),  # alpha_{H2CO}
-    np.linspace(30 * rad, 330 * rad, 1000),  # tau
+# Order: rCO, rCH1, rCH2, alpha_H1CO, alpha_H2CO, tau
+zmat_grids = [
+    np.linspace(1.1, 1.3, 8),
+    np.linspace(0.95, 1.15, 8),
+    np.linspace(0.95, 1.15, 8),
+    np.deg2rad(np.linspace(110.0, 130.0, 8)),
+    np.deg2rad(np.linspace(110.0, 130.0, 8)),
+    np.deg2rad(np.linspace(150.0, 175.0, 8)),
 ]
 
-ncoo = len(grids)
-
-# Compute for G-matrix and pseudopotential
-gmat = Gmat(
-    grids,
-    masses,
+g = Gmat(
+    zmat_grids,
+    zmat_masses,
     lambda q: internal_to_cartesian(zmat_connections, q),
     lambda xyz: cartesian_to_internal(zmat_connections, xyz),
 )
+gvib_zmat, grovib_zmat, grot_zmat = g.run(return_rot=True)
+pseudo_zmat = g.build_pseudopotential_fdf()
+print(gvib_zmat.shape, grovib_zmat.shape, grot_zmat.shape)
+```
+For four atoms, the block shapes are `(6, 6)`, `(3, 6)`, and `(3, 3)`.
 
-gvib_sop, grovib_sop, grot_sop = gmat.run(return_rot=True)
-pseudo_sop = gmat.build_pseudopotential_fdf()
+The current exact SOP implementation requires each new atom in a Z-matrix to be placed using reference bonds and planes generated in earlier construction steps.
+Other reference patterns, including some second-angle definitions, may introduce multivariate square roots that the current SOP algebra cannot handle, which will raise an error.
 
-print("Number of terms for vibrational elements of G-matrix\n i  j no.terms")
-for i in range(ncoo):
-    for j in range(i, ncoo):
-        print(f"{i:2d} {j:2d} {gvib_sop[i, j].nterms:6d}")
+## Body-fixed frame
 
-print("\nNumber of terms for rovibrational elements of G-matrix\n i  j no.terms")
-for i in range(3):
-    for j in range(ncoo):
-        print(f"{i:2d} {j:2d} {grovib_sop[i, j].nterms:6d}")
+The rotational construction follows [Sørensen's formulation](https://doi.org/10.1007/BFb0048009), where three independent conditions on the Cartesian coordinates specify the body-fixed frame.
 
-print("\nNumber of terms for rotational elements of G-matrix\n i  j no.terms")
-for i in range(3):
-    for j in range(i, 3):
-        print(f"{i:2d} {j:2d} {grot_sop[i, j].nterms:6d}")
+By default, KEOSOP infers compatible conditions from the Cartesian embedding supplied by the transformation.
+It does not optimize the frame for symmetry, basis convergence, or SOP compactness. A `frame_conditions(xyz)` callback can supply the three conditions explicitly.
 
-print(f"Number of terms for pseudopotential: {pseudo_sop.nterms:6d}")
+To inspect the inferred conditions and auxiliary data:
 
-# Store into file
-
-filename = "keo_h2co.h5"
-
-save_gmat_hdf5(filename, grids, gvib_sop, grovib_sop, grot_sop, pseudo_sop)
-
-# Load from file
-
-grids, gvib, grovib, grot, pseudo = load_gmat_hdf5(filename)
+```python
+gvib, grovib, grot, aux = g.run(return_rot=True, return_svec=True)
+print("Inferred frame conditions:", aux["frame_conditions"])
 ```
 
-Examples
------
-More examples and user contributions for various molecules can be found in the [examples](examples) folder.
+The auxiliary data also include the Cartesian SOP coordinates, $s$-vectors, and rotational frame-condition Jacobian `J`.
 
-Citation
------
-If you use this code in your research, please cite:
-> A. Yachmenev, G. Rauhut, "Automated sum-of-products construction of rovibrational kinetic energy operators in curvilinear coordinates without Taylor expansion, multidimensional fitting, or symbolic algebra", *J. Chem. Phys.* **XXX**, XXXXXX (2026) [DOI:](https://doi.org/), [arXiv:](https://doi.org/)
+## Singularity tracing
+
+Recognized coordinate singularities can be retained as protected analytical prefactors using the separate experimental `keosop.sing` implementation.
+For example, the following code traces sine factors associated with the two valence angles in the formaldehyde Z-matrix example:
+
+```python
+from keosop.sing.gmat import Gmat
+from keosop.sing.zmat import (
+    cartesian_to_internal as singular_cartesian_to_internal,
+    internal_to_cartesian as singular_internal_to_cartesian,
+)
+
+g = Gmat(
+    zmat_grids,
+    zmat_masses,
+    lambda q: singular_internal_to_cartesian(zmat_connections, q),
+    lambda xyz: singular_cartesian_to_internal(zmat_connections, xyz),
+    trace_singularities=True,
+    singularity_coo=(3, 4),
+    singularity_kinds=("sin",),
+)
+
+gvib, _, _ = g.run(return_rot=True)
+print(gvib[5, 5].singularity_summary()) # G_{tau,tau} element (dihedral angle)
+```
+
+Protected factors are stored separately from the numerical arrays in `sop.terms`.
+For these objects, use `sop.evaluate(indices)` to include the analytical prefactors, and `sop.singularity_summary()` to inspect them.
+Summing only the numerical factors does not reconstruct the complete singular expression.
+See the [HCN](examples/hcn_jacobi.ipynb) and [HCCH](examples/hcch_zmat.ipynb) notebooks for examples.
+
+## Optional N-mode approximation
+
+A truncated $N$-mode expansion can restrict the number of simultaneously coupled coordinates in each $G$-matrix element:
+
+```python
+g = Gmat(
+    grids,
+    masses,
+    builder.internal_to_cartesian,
+    builder.cartesian_to_internal,
+    nmode_order=2,
+    nmode_ref_indices=[len(grid) // 2 for grid in grids],
+)
+gvib_2mode = g.run()
+```
+
+The reference indices `nmode_ref_indices` select the reference point for each coordinate grid. 
+
+## Supported operations and limitations
+
+The standard SOP backend supports sums, products, and nonnegative integer powers.
+It also expands sine and cosine functions of additively separable arguments, such as `cos(q0 + q1)`, using addition formulas.
+Reciprocals are supported when the denominator reduces to a single separable product or depends on one coordinate, and not equal to zero.
+
+General multivariate nonlinear functions are not automatically factorized.
+Examples of functions that are currently outside the supported rules include (even when an exact factorization exists):
+- `1 / (1 + q0 * q1)`
+- `np.exp(q0 * q1)`
+- `np.exp(q0 + q1)`
+
+An unsupported operation raises an error rather than silently introducing a fit.
+The singularity-tracing backend has a more restricted set of function rules.
+For example, it does not currently include the standard multivariate sine and cosine addition formulas.
+
+Other practical limitations:
+- The rotational construction requires inversion of a geometry-dependent $3\times 3$ frame matrix.
+A singular determinant or an unsupported reciprocal can prevent construction.
+- Runtime and memory depend on intermediate term growth, coordinate definitions, grid sizes, and simplification settings.
+- The formulation uses $M=3N-6$ internal coordinates.
+Linear configurations can occur as singular limits, as illustrated by the HCN and HCCH examples.
+- Automatic numerical low-rank fitting of unsupported intermediates remains a possible extension and is not currently implemented.
+
+## More examples and numerical validation
+
+The [`examples` directory](examples) contains complete scripts and notebooks:
+
+## Citation
+
+If you use KEOSOP in your research, please cite the associated manuscript:
+
+> A. Yachmenev and G. Rauhut, “Automated sum-of-products construction of rovibrational kinetic energy operators in curvilinear coordinates without Taylor expansion, multidimensional fitting, or symbolic algebra” (2026).
 
 ```bibtex
 @article{Yachmenev_JCPXXX_2026,
@@ -241,6 +323,10 @@ If you use this code in your research, please cite:
 }
 ```
 
-Contact
------
-For questions or feedback, feel free to open an issue or reach out to the authors directly via andrey.yachmenev@robochimps.com
+## License
+
+KEOSOP is distributed under the [MIT License](LICENSE).
+
+## Contact
+
+For questions, bug reports, and feature requests, open a [GitHub issue](https://github.com/robochimps/keosop/issues) or contact [andrey.yachmenev@robochimps.com](mailto:andrey.yachmenev@robochimps.com).
