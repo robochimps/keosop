@@ -143,7 +143,7 @@ save_gmat_hdf5(
     pseudo,
     coo_names=("r1", "r2", "alpha"),
     coo_units=("angstrom", "angstrom", "rad"),
-    metadata={"molecule": "H2O"},
+    metadata={"molecule": "H2O", "coordinates": "valence"},
 )
 
 (
@@ -202,7 +202,7 @@ gvib_zmat, grovib_zmat, grot_zmat = g.run(return_rot=True)
 pseudo_zmat = g.build_pseudopotential_fdf()
 print(gvib_zmat.shape, grovib_zmat.shape, grot_zmat.shape)
 ```
-For four atoms, the block shapes are `(6, 6)`, `(3, 6)`, and `(3, 3)`.
+For four atoms, the $G$-matrix block shapes are `(6, 6)`, `(3, 6)`, and `(3, 3)`.
 
 The current exact SOP implementation requires each new atom in a Z-matrix to be placed using reference bonds and planes generated in earlier construction steps.
 Other reference patterns, including some second-angle definitions, may introduce multivariate square roots that the current SOP algebra cannot handle, which will raise an error.
@@ -270,7 +270,7 @@ g = Gmat(
 gvib_2mode = g.run()
 ```
 
-The reference indices `nmode_ref_indices` select the reference point for each coordinate grid. 
+The reference indices `nmode_ref_indices` select the reference expansion point for each coordinate grid. 
 
 ## Supported operations and limitations
 
@@ -298,7 +298,7 @@ Linear configurations can occur as singular limits, as illustrated by the HCN an
 
 ## More examples and numerical validation
 
-The [`examples` directory](examples) contains complete scripts and notebooks:
+The [`examples`](examples) directory contains complete scripts and notebooks.
 
 ## Citation
 
