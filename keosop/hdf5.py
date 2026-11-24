@@ -122,7 +122,48 @@ def save_gmat_hdf5(
     metadata=None,
     compress="gzip",
 ):
-    """Save G-matrices in an HDF5 file"""
+    """Save coordinate grids, sum-of-products (SOP) G-matrices, and a pseudopotential to HDF5.
+
+    Parameters
+    ----------
+    filename : str
+        Destination file. An existing file is overwritten.
+    grids : sequence of one-dimensional array_like of float64
+        One grid per internal coordinate, in the same order as the factors of every SOP.
+    gvib_sop : array_like of SumProd, shape (M, M), or None
+        Vibrational block on the supplied grids, where M is the number of coordinates (grids).
+        None omits the block.
+    grovib_sop : array_like of SumProd, shape (3, M), optional
+        Rovibrational coupling block on the supplied grids. None omits the block.
+    grot_sop : array_like of SumProd, shape (3, 3), optional
+        Rotational block on the supplied grids. None omits the block.
+    pseudo_sop : SumProd or None, optional
+        Pseudopotential on the supplied grids. None omits it.
+    coo_names : sequence of str or None, optional
+        Coordinate names, with exactly one entry per coordinate (grid).
+    coo_units : sequence of str or None, optional
+        Coordinate unit labels, with exactly one entry per grid.
+        Labels are stored as strings and no unit conversion is performed.
+    metadata : mapping or None, optional
+        Additional root HDF5 attributes. Values must be HDF5-compatible scalars, strings or bytes.
+    compress : str, int, or None, default="gzip"
+        HDF5 dataset compression filter accepted by h5py, or None to disable
+        compression.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Matrices are stored in full, including both halves of symmetric blocks.
+    Both regular SumProd objects and the singular variant's protected analytical
+    factor metadata are supported.
+
+    See Also
+    --------
+    load_gmat_hdf5
+    """
     grids, sizes, offsets, values = _grid_layout(grids)
     ncoo = len(grids)
 
@@ -264,7 +305,40 @@ def _read_matrix(parent, name, grids, sumprod_cls):
 
 
 def load_gmat_hdf5(filename, sumprod_cls=None, return_metadata=False):
-    """Load an HDF5 file written by save_gmat_hdf5"""
+    """Load coordinate grids and sum-of-products (SOP) operators saved by save_gmat_hdf5.
+
+    Parameters
+    ----------
+    filename : str
+        Existing KEOSOP-GMAT HDF5 file to read.
+    sumprod_cls : callable or None, optional
+        Constructor used to recreate each SOP from its list of terms.
+    return_metadata : bool, default=False
+        Append a dictionary of root file attributes and available coordinate
+        names and unit labels to the return tuple.
+
+    Returns
+    -------
+    grids : list of numpy.ndarray
+        One independent float64 array of grid values per internal coordinate.
+    gvib : numpy.ndarray or None
+        Vibrational SOP block, shape (M, M), with dtype=object.
+    grovib : numpy.ndarray or None
+        Rovibrational block, shape (3, M).
+    grot : numpy.ndarray or None
+        Rotational block, shape (3, 3).
+    pseudo : object or None
+        Pseudopotential.
+    metadata : dict
+        Included only when `return_metadata=True`. Contains all root attributes,
+        together with `coo_names`` and `coo_units` when present.
+        The default return tuple is `(grids, gvib, grovib, grot, pseudo)` and metadata
+        is its sixth element when requested.
+
+    See Also
+    --------
+    save_gmat_hdf5
+    """
     if sumprod_cls is None:
         sumprod_cls = _default_sumprod_class()
 
