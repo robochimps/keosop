@@ -388,6 +388,48 @@ class SumProd:
         nterms_thresh=COMPRESS_NTERMS_THRESH,
         identity_tol=0.0,
     ):
+        """Reduce the number of sum-of-products (SOP} terms by combining compatible products.
+
+        Parameters
+        ----------
+        tol : float, default=0
+            Absolute tolerance for approximate factor comparisons.
+            After exact hash grouping, it enables another grouping that merges terms whose
+            factors agree within `tol` at every grid point in all but one coordinate.
+            Zero performs only exact grouping.
+        zero_tol : float, default=0
+            Discard a product if any factor has absolute values at most `zero_tol`
+            at every grid point. Zero removes only exactly zero factors.
+        max_sweeps : int or None, optional
+            Maximum number of sweeps over all coordinates in each compression phase.
+            None repeats until no further terms can be combined.
+        nterms_thresh : int, default=100
+            Minimum initial term count required to run compression.
+            If fewer terms are present, return self without any simplification.
+            Set to 1 to force compression even for a single-term SOP.
+        identity_tol : float, default=0
+            Scaled tolerance for simplifying factors produced by merging,
+            that is nearly constant arrays become constant, with values near zero or +/-1
+            snapped to those values.
+            The scale is at least one and otherwise set by the factor magnitude.
+            Zero permits only exact identities.
+
+        Returns
+        -------
+        compressed : SumProd
+            A new SOP or self when the number of terms is below `nterms_thresh`.
+            An identically zero result is represented by one zero product rather than an empty SOP.
+
+        Notes
+        -----
+        Hash grouping applies compression rule first.
+        Approximate grouping is optional and may change the represented values.
+        Nonzero `zero_tol` and `identity_tol` can also introduce approximations even when `tol` is zero.
+        With all tolerances zero, compression preserves the represented values up to floating-point arithmetic.
+
+        Compression does not guarantee a minimal term count or a global error bound.
+        """
+
         if self.nterms < nterms_thresh:
             return self
 
