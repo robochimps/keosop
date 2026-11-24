@@ -1,4 +1,8 @@
-from itertools import combinations
+import operator
+import weakref
+from collections import OrderedDict
+from itertools import combinations, combinations_with_replacement
+from time import perf_counter
 
 import numpy as np
 
@@ -6,13 +10,19 @@ from keosop.revad import (
     Expr,
     _geom_cache,
     as_expr,
+    dot,
     expr_signature,
     init_cartesian,
-    dot,
     norm,
     reverse_derivatives,
 )
-from keosop.sumprod import SumProd, init_internal, sop_reciprocal, sop_ufunc
+from keosop.sumprod import (
+    COMPRESS_NTERMS_THRESH,
+    SumProd,
+    init_internal,
+    sop_reciprocal,
+    sop_ufunc,
+)
 
 
 def geom_expanded_signatures(node):
@@ -136,7 +146,553 @@ def eval_expr(root, x_bindings, grids, q_bindings, cache=None):
     return out
 
 
+class _PseudopotentialFactor:
+    __slots__ = (
+        "id",
+        "values",
+        "finite",
+        "has_nan",
+        "constant",
+        "zeros",
+        "__weakref__",
+    )
+
+    def __init__(self, identifier, values):
+        self.id = identifier
+        self.values = values
+        self.finite = bool(np.all(np.isfinite(values)))
+        self.has_nan = bool(np.any(np.isnan(values)))
+        self.constant = bool(np.all(values == values[0]))
+        self.zeros = {0.0: bool(np.all(values == 0.0))}
+
+
+class _PseudopotentialContext:
+    def __init__(self, grids, fd_info, max_comparisons):
+        self.grids, self.fd_info = grids, fd_info
+        self.ncoo = len(grids)
+        self.max_comparisons = max_comparisons
+        self.factors = weakref.WeakValueDictionary()
+        self.products = weakref.WeakValueDictionary()
+        self.scales = weakref.WeakValueDictionary()
+        self.derivatives = weakref.WeakValueDictionary()
+        self.simplifications = weakref.WeakValueDictionary()
+        self.comparisons = OrderedDict()
+        self.comparison_tables = OrderedDict()
+        self.comparison_table_bytes = 0
+        self.next_id = 0
+        self.ones = tuple(self.intern(np.ones(len(g))) for g in grids)
+        self.stats = dict(
+            factors_created=self.next_id,
+            factor_reuses=0,
+            factor_comparison_requests=0,
+            factor_comparison_hits=0,
+            factor_array_comparisons=0,
+            factor_comparison_evictions=0,
+            peak_comparison_cache_entries=0,
+            peak_live_factors=len(self.factors),
+            product_cache_hits=0,
+            derivative_cache_hits=0,
+            comparison_table_hits=0,
+            comparison_table_builds=0,
+            comparison_table_evictions=0,
+            peak_comparison_table_bytes=0,
+            peak_comparison_table_entries=0,
+            hashed_compressions=0,
+            similar_compressions=0,
+        )
+
+    def intern(self, value):
+        array = np.asarray(value, dtype=float)
+
+        # Use the same signed-zero normalization as SumProd.factor_key
+        key = SumProd.factor_key(array)
+        existing = self.factors.get(key)
+
+        if existing is not None:
+            if hasattr(self, "stats"):
+                self.stats["factor_reuses"] += 1
+            return existing
+
+        owned = array.copy()
+        owned.flags.writeable = False
+        factor = _PseudopotentialFactor(self.next_id, owned)
+
+        self.next_id += 1
+        self.factors[key] = factor
+
+        if hasattr(self, "stats"):
+            self.stats["factors_created"] += 1
+            self.stats["peak_live_factors"] = max(
+                self.stats["peak_live_factors"], len(self.factors)
+            )
+        return factor
+
+    def constant(self, value):
+        factors = list(self.ones)
+        factors[0] = self.scale(factors[0], float(value))
+        return _PseudopotentialSOP(self, (tuple(factors),))
+
+    def import_sop(self, sop):
+        if not isinstance(sop, SumProd) or any(getattr(sop, "protected", ())):
+            raise TypeError(
+                "build_pseudopotential_fdf supports regular SumProd factors only"
+            )
+        return _PseudopotentialSOP(
+            self, tuple(tuple(self.intern(f) for f in term) for term in sop.terms)
+        )
+
+    def zero_factor(self, factor, tol):
+        if tol not in factor.zeros:
+            factor.zeros[tol] = bool(SumProd.is_zero_factor(factor.values, tol))
+        return factor.zeros[tol]
+
+    def zero_sop(self, sop):
+        return all(
+            any(self.zero_factor(f, 0.0) for f in term) and all(f.finite for f in term)
+            for term in sop.terms
+        )
+
+    def multiply(self, left, right):
+        key = left.id, right.id
+        result = self.products.get(key)
+        if result is not None:
+            self.stats["product_cache_hits"] += 1
+            return result
+
+        result = self.intern(left.values * right.values)
+        self.products[key] = result
+        return result
+
+    def factor_table(self, factors, tol):
+        key = tuple(f.id for f in factors), float(tol)
+
+        result = self.comparison_tables.get(key)
+        if result is not None:
+            self.comparison_tables.move_to_end(key)
+            self.stats["comparison_table_hits"] += 1
+            return result
+
+        self.stats["comparison_table_builds"] += 1
+
+        result = np.empty((len(factors), len(factors)), dtype=bool)
+        for a, left in enumerate(factors):
+            result[a, a] = self.close(left, left, tol)
+            for b in range(a + 1, len(factors)):
+                result[a, b] = result[b, a] = self.close(left, factors[b], tol)
+
+        result.flags.writeable = False
+
+        if self.max_comparisons and result.nbytes <= 4 * 1024**2:
+            self.comparison_tables[key] = result
+            self.comparison_table_bytes += result.nbytes
+
+            while (
+                len(self.comparison_tables) > 128
+                or self.comparison_table_bytes > 4 * 1024**2
+            ):
+                _, old = self.comparison_tables.popitem(last=False)
+                self.comparison_table_bytes -= old.nbytes
+                self.stats["comparison_table_evictions"] += 1
+
+            self.stats["peak_comparison_table_bytes"] = max(
+                self.stats["peak_comparison_table_bytes"], self.comparison_table_bytes
+            )
+            self.stats["peak_comparison_table_entries"] = max(
+                self.stats["peak_comparison_table_entries"], len(self.comparison_tables)
+            )
+        return result
+
+    def scale(self, factor, value):
+        key = factor.id, np.float64(value).tobytes()
+
+        result = self.scales.get(key)
+        if result is not None:
+            return result
+
+        result = self.intern(factor.values * value)
+
+        self.scales[key] = result
+        return result
+
+    def close(self, left, right, tol):
+        self.stats["factor_comparison_requests"] += 1
+        if left.id == right.id:
+            self.stats["factor_comparison_hits"] += 1
+            return left.finite if tol > 0.0 else not left.has_nan
+
+        key = min(left.id, right.id), max(left.id, right.id), float(tol)
+
+        result = self.comparisons.get(key)
+        if result is not None:
+            self.comparisons.move_to_end(key)
+            self.stats["factor_comparison_hits"] += 1
+            return result
+
+        if left.values.shape != right.values.shape:
+            result = False
+        elif left.constant and right.constant and left.finite and right.finite:
+            delta = abs(left.values[0] - right.values[0])
+            result = bool(delta <= tol) if tol > 0.0 else bool(delta == 0.0)
+        else:
+            self.stats["factor_array_comparisons"] += 1
+            result = bool(SumProd.factors_close(left.values, right.values, tol))
+
+        if self.max_comparisons:
+            self.comparisons[key] = result
+            if len(self.comparisons) > self.max_comparisons:
+                self.comparisons.popitem(last=False)
+                self.stats["factor_comparison_evictions"] += 1
+            self.stats["peak_comparison_cache_entries"] = max(
+                self.stats["peak_comparison_cache_entries"], len(self.comparisons)
+            )
+
+        return result
+
+    def simplify(self, factor, tol):
+        key = factor.id, float(tol)
+
+        result = self.simplifications.get(key)
+        if result is not None:
+            return result
+
+        values, changed = SumProd.simplify_1d_factor(factor.values, tol)
+        result = self.intern(values) if changed else factor
+
+        self.simplifications[key] = result
+        return result
+
+    def fdf(self, sop, n=None, m=None):
+        orders = [0] * self.ncoo
+
+        if n is not None:
+            orders[n] = 1
+
+        if m is not None:
+            orders[m] += 1
+
+        terms = []
+        for term in sop.terms:
+            factors = []
+
+            for k, (factor, order) in enumerate(zip(term, orders)):
+                key = factor.id, k, order
+                result = self.derivatives.get(key)
+
+                if result is None:
+                    ci = self.fd_info[k]
+                    if order == 0:
+                        values = factor.values[ci["orig_inds"]]
+                    else:
+                        values = np.array(
+                            [
+                                np.dot(w1 if order == 1 else w2, factor.values[inds])
+                                for inds, w1, w2 in ci["points"]
+                            ]
+                        )
+
+                    result = self.intern(values)
+                    self.derivatives[key] = result
+
+                else:
+                    self.stats["derivative_cache_hits"] += 1
+
+                factors.append(result)
+
+            terms.append(tuple(factors))
+
+        return _PseudopotentialSOP(self, tuple(terms))
+
+
+class _PseudopotentialSOP:
+
+    def __init__(self, context, terms):
+        self.context, self.terms = context, tuple(terms)
+
+    @property
+    def nterms(self):
+        return len(self.terms)
+
+    def export(self):
+        return SumProd([[f.values for f in term] for term in self.terms])
+
+    def __add__(self, other):
+        if np.isscalar(other):
+            other = self.context.constant(other)
+
+        if (
+            not isinstance(other, _PseudopotentialSOP)
+            or other.context is not self.context
+        ):
+            return NotImplemented
+
+        return _PseudopotentialSOP(self.context, self.terms + other.terms).compress()
+
+    __radd__ = __add__
+
+    def __neg__(self):
+        return self * -1.0
+
+    def __sub__(self, other):
+        return self + (-other)
+
+    def __mul__(self, other):
+        context = self.context
+
+        if np.isscalar(other):
+            return _PseudopotentialSOP(
+                context,
+                tuple(
+                    (context.scale(term[0], float(other)),) + term[1:]
+                    for term in self.terms
+                ),
+            )
+
+        if not isinstance(other, _PseudopotentialSOP) or other.context is not context:
+            return NotImplemented
+
+        return _PseudopotentialSOP(
+            context,
+            tuple(
+                tuple(context.multiply(a, b) for a, b in zip(left, right))
+                for left in self.terms
+                for right in other.terms
+            ),
+        ).compress()
+
+    __rmul__ = __mul__
+
+    def _nonzero_terms(self, zero_tol):
+        c = self.context
+        return [
+            term
+            for term in self.terms
+            if not any(c.zero_factor(f, zero_tol) for f in term)
+        ]
+
+    def compress_hashed(self, zero_tol=0.0, max_sweeps=None, identity_tol=0.0):
+        c = self.context
+        c.stats["hashed_compressions"] += 1
+
+        terms = self._nonzero_terms(zero_tol)
+        sweep, changed = 0, True
+        while terms and changed and (max_sweeps is None or sweep < max_sweeps):
+            sweep += 1
+            changed = False
+
+            for k in range(c.ncoo):
+
+                groups = {}
+                for term in terms:
+                    key = tuple(f.id for j, f in enumerate(term) if j != k)
+                    groups.setdefault(key, []).append(term)
+
+                new_terms = []
+                for group in groups.values():
+                    if len(group) == 1:
+                        new_terms.append(group[0])
+                        continue
+                    merged = list(group[0])
+                    merged[k] = c.simplify(
+                        c.intern(np.add.reduce([term[k].values for term in group])),
+                        identity_tol,
+                    )
+
+                    changed = True
+
+                    if not c.zero_factor(merged[k], zero_tol):
+                        new_terms.append(tuple(merged))
+
+                terms = new_terms
+
+                if not terms:
+                    break
+
+        return _PseudopotentialSOP(c, tuple(terms)) if terms else c.constant(0.0)
+
+    def _column_matches(self, terms, k, tol):
+        c = self.context
+        unique = {}
+        for term in terms:
+            factor = term[k]
+            unique.setdefault(factor.id, factor)
+        factors = [unique[identifier] for identifier in sorted(unique)]
+        lookup = {factor.id: index for index, factor in enumerate(factors)}
+        indices = np.fromiter((lookup[t[k].id] for t in terms), dtype=int)
+        close = c.factor_table(factors, tol)
+        return close[indices[:, None], indices[None, :]]
+
+    def _mismatches(self, terms, tol):
+        counts = np.zeros((len(terms), len(terms)), dtype=np.int32)
+        for k in range(self.context.ncoo):
+            counts += ~self._column_matches(terms, k, tol)
+        return counts
+
+    def compress_similar(
+        self, tol=1e-10, zero_tol=0.0, max_sweeps=None, identity_tol=0.0
+    ):
+        c = self.context
+        c.stats["similar_compressions"] += 1
+
+        terms = self._nonzero_terms(zero_tol)
+        sweep, changed = 0, True
+        mismatches = None
+
+        while terms and changed and (max_sweeps is None or sweep < max_sweeps):
+            sweep += 1
+            changed = False
+
+            for k in range(c.ncoo):
+                if len(terms) <= 512:
+                    if mismatches is None:
+                        mismatches = self._mismatches(terms, tol)
+                    column = self._column_matches(terms, k, tol)
+                    match = mismatches == ~column
+                else:
+                    match = None
+                used = np.zeros(len(terms), dtype=bool)
+
+                new_terms = []
+                representatives = []
+                merged_in_phase = False
+
+                for i, term in enumerate(terms):
+                    if used[i]:
+                        continue
+
+                    used[i] = True
+                    merged = list(term)
+                    values = None
+
+                    if match is not None:
+                        candidates = np.flatnonzero(match[i] & ~used)
+                    else:
+                        candidates = (
+                            j
+                            for j in range(i + 1, len(terms))
+                            if not used[j]
+                            and all(
+                                c.close(term[a], terms[j][a], tol)
+                                for a in range(c.ncoo)
+                                if a != k
+                            )
+                        )
+
+                    for j in candidates:
+                        if values is None:
+                            values = term[k].values.copy()
+                        values += terms[j][k].values
+                        used[j] = True
+                        changed = True
+                        merged_in_phase = True
+
+                    if values is not None:
+                        merged[k] = c.simplify(c.intern(values), identity_tol)
+
+                    if not c.zero_factor(merged[k], zero_tol):
+                        new_terms.append(tuple(merged))
+                        representatives.append(i)
+
+                if mismatches is not None and new_terms and merged_in_phase:
+                    selected = np.ix_(representatives, representatives)
+                    mismatches = (
+                        mismatches[selected]
+                        + column[selected].astype(np.int32)
+                        - self._column_matches(new_terms, k, tol).astype(np.int32)
+                    )
+
+                terms = new_terms
+
+                if not terms:
+                    break
+
+        return _PseudopotentialSOP(c, tuple(terms)) if terms else c.constant(0.0)
+
+    def compress(
+        self,
+        tol=0.0,
+        zero_tol=0.0,
+        max_sweeps=None,
+        nterms_thresh=COMPRESS_NTERMS_THRESH,
+        identity_tol=0.0,
+    ):
+        if self.nterms < nterms_thresh:
+            return self
+
+        result = self.compress_hashed(zero_tol, max_sweeps, identity_tol)
+
+        if tol > 0.0:
+            result = result.compress_similar(tol, zero_tol, max_sweeps, identity_tol)
+        return result
+
+
 class Gmat:
+    """Build molecular kinetic-energy G-matrices in sum-of-products (SOP) form.
+
+    Parameters
+    ----------
+    grids : sequence of one-dimensional array_like
+        One grid per internal coordinate, in the order used by both coordinate
+        transformations.
+        Grids must be nonempty and strictly increasing when computing the
+        finite-difference pseudopotential.
+    masses : array_like, shape (N,)
+        Positive atomic masses of N atoms, in the same atom order as the Cartesian arrays.
+    internal_to_cartesian : callable
+        Function `xyz = internal_to_cartesian(q)` accepting one sequence of M internal coordinates
+        and returning an array_like of shape (N, 3), with Cartesian components ordered as x, y, z.
+        During construction, each q[k] is a `keosop.sumprod.SumProd` object, rather than a numeric scalar.
+        Returned components must be SumProd objects or numeric constants.
+    cartesian_to_internal : callable
+        Function `q = cartesian_to_internal(xyz)` accepting an object array of shape (N, 3) containing
+        `keosop.revad.Expr` Cartesian variables.
+        Return M `Expr` objects in the same coordinate order as `grids`.
+    frame_conditions : callable, None, or "auto", optional
+        Three independent constraints defining the rotational frame.
+        A callable `frame_conditions(xyz)` receives an (N, 3) `Expr` array and returns three
+        scalar expressions, evaluated with center-of-mass-centered geometry.
+        None or "auto" infers constraints from the Cartesian SOP geometry.
+        Used for rotational blocks and the pseudopotential.
+    compress_tol : float, default=1e-10
+        Absolute similarity tolerance for G-matrix compression.
+    compress_zero_tol : float, default=1e-14
+        Absolute threshold for discarding a product containing a near-zero factor.
+    compress_identity_tol : float, default=1e-12
+        Scaled tolerance for simplifying nearly constant factors during merging.
+    compress_nterms_thresh : int, default=10
+        Term-count trigger for intermediate G-matrix and pseudopotential compression.
+        Final nonzero G-matrix elements and pseudopotential are compressed regardless of this trigger.
+    nmode_order : int or None, optional
+        Maximum number of simultaneously coupled coordinates retained in each G-matrix element truncated
+        N-mode expansion. None keeps the full SOP.
+    nmode_ref_indices : sequence of int or None, optional
+        One valid grid index per coordinate defining the N-mode reference point.
+        Required when `nmode_order` is not None.
+
+    Notes
+    -----
+    Both transformations must describe the same coordinates and atom order:
+    `cartesian_to_internal(internal_to_cartesian(q))` should recover q on the
+    chosen coordinate domain, with consistent angular branches.
+
+    For Cartesian-to-internal transformation, use `keosop.revad` helpers such as
+    `distance`, `angle`, `dihedral`, `dot`, and `norm`.
+
+    All intermediate expressions must be supported by the exact SOP algebra.
+    General multivariate nonlinear functions and reciprocals may raise NotImplementedError
+    when no implemented finite SOP representation exists.
+    The pseudopotential evaluates displaced geometries outside the supplied grid
+    endpoints, so the transformations must remain valid there as well.
+
+    Call `run` to build the G-matrix blocks and `build_pseudopotential_fdf` separately to build the pseudopotential.
+
+    See Also
+    --------
+    Gmat.run,
+    Gmat.build_pseudopotential_fdf,
+    keosop.zmat.internal_to_cartesian,
+    keosop.zmat.cartesian_to_internal
+    """
+
     def __init__(
         self,
         grids,
@@ -242,103 +798,175 @@ class Gmat:
 
         return q_expr
 
+    @staticmethod
+    def _structural_zero(value):
+        """Recognize explicit zero products, without tolerance or cancellation"""
+        if not isinstance(value, SumProd):
+            return bool(value == 0.0)
+        for term in value.terms:
+            if not any(not np.any(factor) for factor in term):
+                return False
+            if not all(np.all(np.isfinite(factor)) for factor in term):
+                return False
+        return True
+
+    @classmethod
+    def _component_support(cls, svec):
+        """Return active flattened Cartesian components for every s-vector row"""
+        zero_by_id = {}
+        support = []
+        for row in svec:
+            active = set()
+
+            for component, value in enumerate(row.flat):
+                key = id(value)
+
+                if key not in zero_by_id:
+                    zero_by_id[key] = cls._structural_zero(value)
+
+                if not zero_by_id[key]:
+                    active.add(component)
+
+            support.append(frozenset(active))
+
+        return tuple(support)
+
+    @staticmethod
+    def _rows_by_component(support):
+        rows = {}
+        for index, components in enumerate(support):
+            for component in components:
+                rows.setdefault(component, []).append(index)
+        return rows
+
+    def _compress_g(self, value):
+        return value.compress(
+            nterms_thresh=1,
+            tol=self.compress_tol,
+            zero_tol=self.compress_zero_tol,
+            identity_tol=self.compress_identity_tol,
+        )
+
+    def _contract_svec(self, svec1, svec2, support1, support2, block_name="G"):
+        """Accumulate candidate pairs using only shared Cartesian components"""
+        block_start = perf_counter()
+        symmetric = svec1 is svec2
+
+        rows1 = self._rows_by_component(support1)
+        rows2 = rows1 if symmetric else self._rows_by_component(support2)
+
+        pairs = set()
+        for component in rows1.keys() & rows2.keys():
+            if symmetric:
+                pairs.update(combinations_with_replacement(rows1[component], 2))
+            else:
+                pairs.update((i, j) for i in rows1[component] for j in rows2[component])
+
+        zero = SumProd.constant(0.0, self.grids)
+        gmat = np.empty((len(svec1), len(svec2)), dtype=object)
+
+        for lam in range(len(svec1)):
+            for mu in range(lam if symmetric else 0, len(svec2)):
+                start = perf_counter()
+                value = zero
+                structural_zero = (lam, mu) not in pairs
+
+                if not structural_zero:
+                    for component in sorted(support1[lam] & support2[mu]):
+                        atom, alpha = divmod(component, 3)
+                        value = value + (
+                            svec1[lam, atom, alpha]
+                            * svec2[mu, atom, alpha]
+                            / self.masses[atom]
+                        )
+                        if value.nterms > self.compress_nterms_thresh:
+                            value = self._compress_g(value)
+                    value = self._compress_g(value)
+                    if self.nmode_order is not None:
+                        value = value.nmode_project(
+                            self.nmode_order,
+                            self.nmode_ref_indices,
+                            zero_tol=self.compress_zero_tol,
+                            identity_tol=self.compress_identity_tol,
+                        )
+                        value = self._compress_g(value)
+                gmat[lam, mu] = value
+                elapsed = perf_counter() - start
+                suffix = " (structural zero)" if structural_zero else ""
+
+                # print(
+                #     f"{block_name}[{lam}, {mu}]: {elapsed:.6f} s{suffix}",
+                #     flush=True,
+                # )
+
+                if symmetric and lam != mu:
+                    start = perf_counter()
+                    gmat[mu, lam] = value
+                    elapsed = perf_counter() - start
+
+                    # print(
+                    #     f"{block_name}[{mu}, {lam}]: {elapsed:.6f} s"
+                    #     f" (symmetry copy of [{lam}, {mu}])",
+                    #     flush=True,
+                    # )
+
+        print(f"{block_name} total: {perf_counter() - block_start:.3f} s", flush=True)
+        return gmat
+
     def build_vib_svec(self, xyz_sop):
-        # trace x->q
+        """Evaluate present AD derivatives, sharing a cache within each row"""
         q_expr = self.trace_q()
 
-        # sum-of-products for Cartesian coordinates
         xyz_bindings = {
-            f"{alpha}{i}": xyz_sop[i, ialpha]
+            f"{alpha}{i}": xyz_sop[i, a]
             for i in range(self.natoms)
-            for ialpha, alpha in enumerate(("x", "y", "z"))
+            for a, alpha in enumerate("xyz")
+        }
+
+        components = {
+            f"{alpha}{i}": (i, a)
+            for i in range(self.natoms)
+            for a, alpha in enumerate("xyz")
         }
 
         q_bindings = {}
-        for icoo, qnode in enumerate(q_expr):
-            q_sop = SumProd.init_coordinate(icoo, self.grids)
-            q_bindings[qnode.id] = q_sop
-            q_bindings[("sig", expr_signature(qnode))] = q_sop
+        for index, root in enumerate(q_expr):
+            value = SumProd.init_coordinate(index, self.grids)
+            q_bindings[root.id] = value
+            q_bindings[("sig", expr_signature(root))] = value
 
+        zero = SumProd.constant(0.0, self.grids)
         svec = np.empty((self.ncoo, self.natoms, 3), dtype=object)
+        svec.fill(zero)
 
-        for icoo, root in enumerate(q_expr):
-
-            # graph for derivative dq_icoo / dx
+        for index, root in enumerate(q_expr):
             deriv = reverse_derivatives(root)
+            # Reverse AD can introduce geometry primitives needed by dihedral derivatives,
+            # need to create aliases after differentiating this
+            bindings = add_user_geometry_aliases(q_expr, q_bindings)
 
-            # reverse rules for dihedral can introduce atomic distance()
-            # and angle() factors, so if the user defined the same coordinates
-            # using norm(), dot(), or arccos(), we need to add temporary structural
-            # aliases to the corresponding one-dimensional q SOPs
-            local_q_bindings = add_user_geometry_aliases(q_expr, q_bindings)
-
-            for i in range(self.natoms):
-                for ialpha, alpha in enumerate(("x", "y", "z")):
-
-                    # evaluate graph: substitute Cartesian coordinates
-                    # and internal coordinates by sum-of-product expressions
-                    # defined in `xyz_bindings` and `q_bindings`, respectively
-                    svec[icoo, i, ialpha] = eval_expr(
-                        deriv.get(f"{alpha}{i}", as_expr(0)),
-                        xyz_bindings,
-                        self.grids,
-                        local_q_bindings,
-                    )
+            cache = {}
+            for name, derivative in deriv.items():
+                atom, alpha = components[name]
+                svec[index, atom, alpha] = eval_expr(
+                    derivative, xyz_bindings, self.grids, bindings, cache
+                )
 
         return svec
 
     def prod_svec(self, svec1, svec2):
-        n1, n2 = svec1.shape[0], svec2.shape[0]
-        gmat = np.empty((n1, n2), dtype=object)
+        """Contract s-vectors"""
+        return self._prod_svec(svec1, svec2, "G")
 
-        for lam in range(n1):
-            for mu in range(n2):
-                g = SumProd.constant(0.0, self.grids)
-
-                for i, mass in enumerate(self.masses):
-                    for ialpha in range(3):
-                        g = g + svec1[lam, i, ialpha] * svec2[mu, i, ialpha] / mass
-
-                        if g.nterms > self.compress_nterms_thresh:
-                            g = g.compress(
-                                nterms_thresh=1,
-                                tol=self.compress_tol,
-                                zero_tol=self.compress_zero_tol,
-                                identity_tol=self.compress_identity_tol,
-                            )
-
-                g = g.compress(
-                    nterms_thresh=1,
-                    tol=self.compress_tol,
-                    zero_tol=self.compress_zero_tol,
-                    identity_tol=self.compress_identity_tol,
-                )
-
-                if self.nmode_order is not None:
-                    g = g.nmode_project(
-                        self.nmode_order,
-                        self.nmode_ref_indices,
-                        zero_tol=self.compress_zero_tol,
-                        identity_tol=self.compress_identity_tol,
-                    )
-                    g = g.compress(
-                        nterms_thresh=1,
-                        tol=self.compress_tol,
-                        zero_tol=self.compress_zero_tol,
-                        identity_tol=self.compress_identity_tol,
-                    )
-                gmat[lam, mu] = g
-
-        return gmat
+    def _prod_svec(self, svec1, svec2, block_name):
+        """Contract only overlapping Cartesian components"""
+        support1 = self._component_support(svec1)
+        support2 = support1 if svec1 is svec2 else self._component_support(svec2)
+        return self._contract_svec(svec1, svec2, support1, support2, block_name)
 
     def build_gvib(self, svec):
-        gvib = self.prod_svec(svec, svec)
-
-        for lam in range(self.ncoo):
-            for mu in range(lam + 1, self.ncoo):
-                gvib[mu, lam] = gvib[lam, mu]
-
-        return gvib
+        support = self._component_support(svec)
+        return self._contract_svec(svec, svec, support, support, "Gvib")
 
     def trace_frame_conditions(self):
         """Traces three user-defined rotational frame conditions C_alpha(r)"""
@@ -967,16 +1595,15 @@ class Gmat:
         return srot
 
     def build_full_g(self, svib, srot):
-        """Return vibrational, rotation-vibration, and rotational G blocks"""
-        gvv = self.build_gvib(svib)  # (ncoo, ncoo)
-        grv = self.prod_svec(srot, svib)  # (3, ncoo)
-        grr = self.prod_svec(srot, srot)  # (3, 3)
+        """Return Gvib, Grovib, Grot, reusing component supports across blocks"""
+        vsupport = self._component_support(svib)
+        rsupport = self._component_support(srot)
 
-        for a in range(3):
-            for b in range(a + 1, 3):
-                grr[b, a] = grr[a, b]
-
-        return gvv, grv, grr
+        return (
+            self._contract_svec(svib, svib, vsupport, vsupport, "Gvib"),
+            self._contract_svec(srot, svib, rsupport, vsupport, "Grovib"),
+            self._contract_svec(srot, srot, rsupport, rsupport, "Grot"),
+        )
 
     @staticmethod
     def fdf_weights(x0, x, order):
@@ -997,47 +1624,46 @@ class Gmat:
         )
         return np.linalg.solve(A, b)
 
-    def fdf_augmented_grids(self, stencil=5, step_scale=0.01):
-        """Augment every user grid point by local finite-difference points"""
+    def fdf_augmented_grids(self, stencil=5, fdf_step=1.0e-3):
+        """Augment every grid point with a fixed finite-difference stencil"""
         if stencil < 3 or stencil % 2 == 0:
             raise ValueError("stencil must be an odd integer >= 3")
 
-        if step_scale <= 0.0:
-            raise ValueError("step_scale must be positive")
+        ncoo = len(self.grids)
+        steps = np.asarray(fdf_step, dtype=float)
+
+        if steps.ndim == 0:
+            steps = np.full(ncoo, float(steps), dtype=float)
+        else:
+            steps = steps.ravel()
+            if len(steps) != ncoo:
+                raise ValueError(
+                    "fdf_step must be a scalar or have one value per coordinate"
+                )
+
+        if np.any(~np.isfinite(steps)) or np.any(steps <= 0.0):
+            raise ValueError("all fdf_step values must be finite and positive")
 
         radius = stencil // 2
         aug_grids = []
         info = []
 
-        for g in self.grids:
+        for icoo, g in enumerate(self.grids):
             g = np.asarray(g, dtype=float)
 
-            if len(g) < 2:
+            if g.ndim != 1 or len(g) < 1:
                 raise ValueError(
-                    "each grid needs at least two points for finite differences"
+                    "each user grid must be a non-empty one-dimensional array"
                 )
 
-            if np.any(np.diff(g) <= 0.0):
-                raise ValueError(
-                    "finite-difference pseudopotential requires strictly increasing grids"
-                )
-
-            local_h = np.empty(len(g), dtype=float)
-            for i in range(len(g)):
-                if i == 0:
-                    scale = g[1] - g[0]
-                elif i == len(g) - 1:
-                    scale = g[-1] - g[-2]
-                else:
-                    scale = min(g[i] - g[i - 1], g[i + 1] - g[i])
-
-                local_h[i] = step_scale * scale
+            if len(g) > 1 and np.any(np.diff(g) <= 0.0):
+                raise ValueError("user grids must be strictly increasing")
 
             pts = list(g)
             stencils = []
 
-            for x0, h in zip(g, local_h):
-                xs = x0 + h * np.arange(-radius, radius + 1, dtype=float)
+            for x0 in g:
+                xs = x0 + steps[icoo] * np.arange(-radius, radius + 1, dtype=float)
 
                 pts.extend(xs.tolist())
                 stencils.append(xs)
@@ -1118,13 +1744,81 @@ class Gmat:
             )
         return out
 
-    def build_pseudopotential_fdf(self, stencil=5, step_scale=0.01):
-        """Build the pseudopotential by 1D finite differences of SOP factors"""
-        aug_grids, fd_info = self.fdf_augmented_grids(stencil, step_scale)
+    def build_pseudopotential_fdf(
+        self,
+        stencil=5,
+        fdf_step=1.0e-3,
+        *,
+        compress_tol=1.0e-8,
+        zero_tol=1.0e-10,
+        identity_tol=1.0e-10,
+        max_comparisons=200_000,
+    ):
+        """Build the pseudopotential U in sum-of-products (SOP) form using finite differences.
 
-        # construct the s-vectors on the augmented 1D grids
-        aug = Gmat(
-            aug_grids,
+        Parameters
+        ----------
+        stencil : int, default=5
+            Number of points in each centered finite-difference stencil.
+            First and second derivatives are computed from these points.
+        fdf_step : float or array_like of shape (M,), default=1e-3
+            Absolute finite-difference displacement in each coordinate's units.
+            A scalar applies to every coordinate, otherwise provide one step per coordinate.
+            Stencils extending beyond the original grid endpoints require valid geometries there.
+        compress_tol : float, default=1e-8
+            Absolute similarity tolerance for pseudopotential compression.
+        zero_tol : float, default=1e-10
+            Absolute threshold for discarding a product containing a near-zero factor.
+        identity_tol : float, default=1e-10
+            Scaled tolerance for simplifying nearly constant factors during merging.
+
+        Returns
+        -------
+        pseudo : keosop.sumprod.SumProd
+            Pseudopotential evaluated on the original coordinate grids.
+
+        Notes
+        -----
+
+        Exact factors, products, derivatives, and comparisons are reused in caches local to this call, comparison tables are limited to 128 entries and 4 MB.
+
+        See Also
+        --------
+        Gmat,
+        Gmat.run
+        """
+        started = perf_counter()
+
+        compression = dict(
+            tol=compress_tol, zero_tol=zero_tol, identity_tol=identity_tol
+        )
+
+        for name, value in compression.items():
+            label = "compress_tol" if name == "tol" else name
+            try:
+                if (
+                    isinstance(value, (bool, np.bool_))
+                    or not np.isscalar(value)
+                    or not np.isrealobj(value)
+                ):
+                    raise ValueError
+                value = float(value)
+
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    f"{label} must be a finite nonnegative scalar"
+                ) from None
+
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{label} must be a finite nonnegative scalar")
+
+            compression[name] = value
+
+        max_comparisons = operator.index(max_comparisons)
+
+        grids, info = self.fdf_augmented_grids(stencil, fdf_step)
+        aug = type(self)(
+            grids,
             self.masses,
             self.internal_to_cartesian,
             self.cartesian_to_internal,
@@ -1136,25 +1830,50 @@ class Gmat:
             nmode_order=None,
         )
 
-        _, _, _, aux = aug.run(return_rot=True, return_svec=True)
+        aux = aug.build_svec(return_rot=True)
+
         svib_a, srot_a = aux["svib"], aux["srot"]
+        del aux
 
-        # s-vectors represented on the original grids
-        zord = [0] * self.ncoo
-        svib = np.empty_like(svib_a)
-        srot = np.empty_like(srot_a)
+        prepared = perf_counter()
+        context = _PseudopotentialContext(self.grids, info, max_comparisons)
+        imported = {}
 
-        for n in range(self.ncoo):
-            for i in range(self.natoms):
-                for a in range(3):
-                    svib[n, i, a] = self.fdf_sop(svib_a[n, i, a], fd_info, zord)
+        def import_active(array):
+            raw = {}
+            for row in range(len(array)):
+                for atom in range(self.natoms):
+                    for alpha in range(3):
 
-        for b in range(3):
-            for i in range(self.natoms):
-                for a in range(3):
-                    srot[b, i, a] = self.fdf_sop(srot_a[b, i, a], fd_info, zord)
+                        source = array[row, atom, alpha]
 
-        eps_terms = (
+                        if id(source) not in imported:
+                            imported[id(source)] = context.import_sop(source)
+
+                        sop = imported[id(source)]
+
+                        if not context.zero_sop(sop):
+                            raw[row, 3 * atom + alpha] = sop
+            return raw
+
+        vraw, rraw = import_active(svib_a), import_active(srot_a)
+        del imported, svib_a, srot_a, aug
+
+        vrows = {}
+        for row, component in vraw:
+            vrows.setdefault(component, []).append(row)
+
+        vib = {key: context.fdf(sop) for key, sop in vraw.items()}
+        rot = {key: context.fdf(sop) for key, sop in rraw.items()}
+        zero = context.constant(0.0)
+
+        def add(acc, value):
+            result = acc + value
+            if result.nterms >= self.compress_nterms_thresh:
+                result = result.compress(nterms_thresh=1, **compression)
+            return result
+
+        eps = (
             (0, 1, 2, 1.0),
             (1, 2, 0, 1.0),
             (2, 0, 1, 1.0),
@@ -1163,138 +1882,155 @@ class Gmat:
             (1, 0, 2, -1.0),
         )
 
-        zero = SumProd.constant(0.0, self.grids)
-        U = zero
+        result = zero
 
-        # cache derivatives because the same 1D derivatives occur across several expressions
-        dsv_diag = {}
-        dsrot = {}
-        d2sv = {}
-
-        for i, mass in enumerate(self.masses):
-            mass = float(mass)
-
+        for atom, mass in enumerate(self.masses):
+            rows = [vrows.get(3 * atom + a, ()) for a in range(3)]
             term1 = zero
             for alpha in range(3):
                 w = zero
-                for aa, beta, gamma, sign in eps_terms:
-                    if aa == alpha:
-                        w = self.fdf_add(w, sign * srot[beta, i, gamma])
-                term1 = self.fdf_add(term1, 0.5 * w * w)
+                for aa, beta, gamma, sign in eps:
+                    key = beta, 3 * atom + gamma
+                    if aa == alpha and key in rot:
+                        w = add(w, sign * rot[key])
+                if not context.zero_sop(w):
+                    term1 = add(term1, 0.5 * w * w)
 
             term2 = zero
-            for alpha, beta, gamma, sign in eps_terms:
-                for n in range(self.ncoo):
-                    key = (beta, i, alpha, n)
-                    if key not in dsrot:
-                        orders = [0] * self.ncoo
-                        orders[n] = 1
-                        dsrot[key] = self.fdf_sop(
-                            srot_a[beta, i, alpha], fd_info, orders
+            for alpha, beta, gamma, sign in eps:
+                key = beta, 3 * atom + alpha
+                if key in rraw:
+                    for n in rows[gamma]:
+                        term2 = add(
+                            term2,
+                            sign * vib[n, 3 * atom + gamma] * context.fdf(rraw[key], n),
                         )
-                    term2 = self.fdf_add(term2, sign * svib[n, i, gamma] * dsrot[key])
 
             term3 = zero
             for alpha in range(3):
-                for n in range(self.ncoo):
-                    for m in range(self.ncoo):
-                        key = (m, i, alpha, n, m)
-                        if key not in d2sv:
-                            orders = [0] * self.ncoo
-                            if n == m:
-                                orders[n] = 2
-                            else:
-                                orders[n] = 1
-                                orders[m] = 1
-                            d2sv[key] = self.fdf_sop(
-                                svib_a[m, i, alpha], fd_info, orders
-                            )
-                        term3 = self.fdf_add(term3, svib[n, i, alpha] * d2sv[key])
+                component = 3 * atom + alpha
+                for n in rows[alpha]:
+                    for m in rows[alpha]:
+                        term3 = add(
+                            term3,
+                            vib[n, component] * context.fdf(vraw[m, component], n, m),
+                        )
 
             term4 = zero
             for alpha in range(3):
-                divs = zero
-                for n in range(self.ncoo):
-                    key = (n, i, alpha)
-                    if key not in dsv_diag:
-                        orders = [0] * self.ncoo
-                        orders[n] = 1
-                        dsv_diag[key] = self.fdf_sop(
-                            svib_a[n, i, alpha], fd_info, orders
-                        )
-                    divs = self.fdf_add(divs, dsv_diag[key])
-                term4 = self.fdf_add(term4, 0.5 * divs * divs)
+                component = 3 * atom + alpha
+                divergence = zero
+                for n in rows[alpha]:
+                    divergence = add(divergence, context.fdf(vraw[n, component], n))
+                if not context.zero_sop(divergence):
+                    term4 = add(term4, 0.5 * divergence * divergence)
 
-            U = self.fdf_add(U, (0.25 / mass) * (term1 + term2 - term3 - term4))
+            result = add(result, (0.25 / float(mass)) * (term1 + term2 - term3 - term4))
 
-        return U.compress(
-            tol=self.compress_tol,
-            zero_tol=self.compress_zero_tol,
-            identity_tol=self.compress_identity_tol,
-        )
+        result = result.compress(nterms_thresh=1, **compression).export()
 
-    def run(self, return_rot=False, return_svec=False):
-        """Build SOP G matrices"""
+        finished = perf_counter()
+        print(f"Pseudopotential total: {finished - started:.6f} s", flush=True)
+
+        return result
+
+    def build_svec(self, return_rot=False):
+        """Build the same auxiliary data as `run`, without G contractions"""
         xyz = self.sumprod_x()
         svib = self.build_vib_svec(xyz)
-
+        aux = {"xyz": xyz, "svib": svib}
         if not return_rot:
-            gvib = self.build_gvib(svib)
+            return aux
 
-            if return_svec:
-                return gvib, {"svib": svib, "xyz": xyz}
-
-            return gvib
-
-        # Keep the user's original Cartesian SOP representation
-        # for the vibrational branch above
-
-        # -------------------------------------------------------------
-        # What is implemented below is described in detail in
-        #   Sørensen, G.O. (1979). A new approach to the Hamiltonian of nonrigid molecules.
-        #   In: Large Amplitude Motion in Molecules II. Topics in Current Chemistry, vol 82.
-        #   https://doi.org/10.1007/BFb0048009
-        #   The relevant Section 2.2.3.2 "Axis conventions and rotational s-vectors"
-        # -------------------------------------------------------------
-
-        # Rotational-frame branch need to be expressed in translation-reduced
-        # (COM-centered) coordinates, so we construct rho_i = r_i - R_COM only
-        # for frame inference/differentiation and rotational tangents
+        # Axis conventions and rotational s-vectors follow Sørensen (1979),
+        # Large Amplitude Motion in Molecules II, Section 2.2.3.2:
+        # https://doi.org/10.1007/BFb0048009
+        # Vibrational derivatives use the original geometry.
+        # Only the frame and rotational tangents use COM-centered coordinates.
+        # Apply the COM chain rule to frame derivatives in cvec_translation_free below.
         xyz_com, com = self.com_xyz(xyz)
-        tvec = self.build_tvec(xyz_com)
 
-        # build_cvec(xyz_com) evaluates dC/drho at the COM-centered geometry,
-        # and to obtain derivatives with respect to the original Cartesian
-        # coordinates r, apply the COM chain rule in cvec_translation_free(cvec)
+        tvec = self.build_tvec(xyz_com)
         cvec_raw = self.build_cvec(xyz_com, tvec=tvec)
         cvec = self.cvec_translation_free(cvec_raw)
 
-        # cvec is now translation-reduced and tvec is a pure rotation about the COM,
-        # so J will be built in the translation-reduced frame
         J = self.build_jmat(cvec, tvec)
         Jinv, detJ = self.inverse_3x3_mat(J)
-        srot = self.build_rot_svec(Jinv, cvec)
-        gvv, grv, grr = self.build_full_g(svib, srot)
 
-        if return_svec:
-            return (
-                gvv,
-                grv,
-                grr,
-                {
-                    "xyz": xyz,
-                    "xyz_com": xyz_com,
-                    "com": com,
-                    "svib": svib,
-                    "srot": srot,
-                    "cvec": cvec,
-                    "cvec_raw": cvec_raw,
-                    "tvec": tvec,
-                    "J": J,
-                    "Jinv": Jinv,
-                    "detJ": detJ,
-                    "frame_conditions": self.inferred_frame_conditions,
-                },
+        srot = self.build_rot_svec(Jinv, cvec)
+
+        aux.update(
+            xyz_com=xyz_com,
+            com=com,
+            srot=srot,
+            cvec=cvec,
+            cvec_raw=cvec_raw,
+            tvec=tvec,
+            J=J,
+            Jinv=Jinv,
+            detJ=detJ,
+            frame_conditions=self.inferred_frame_conditions,
+        )
+        return aux
+
+    def run(self, return_rot=False, return_svec=False):
+        """Build dense arrays of G-matrix elements in sum-of-products (SOP) form.
+
+        Parameters
+        ----------
+        return_rot : bool, default=False
+            Also construct the rovibrational and rotational blocks.
+            This requires three independent frame constraints, supplied or inferred from geometry.
+        return_svec : bool, default=False
+            Append a dictionary of intermediate geometry, s-vectors, and frame data to the returned result.
+
+        Returns
+        -------
+        gvib : numpy.ndarray, shape (M, M), dtype=object
+            Vibrational G-matrix block, with SumProd elements on the original grids,
+            where M is the number of internal coordinates.
+            Returned alone when both flags are False,
+            or as `(gvib, aux)` when only `return_svec` is True.
+        grovib : numpy.ndarray, shape (3, M), dtype=object
+            Rovibrational G-matrix block, returned if `return_rot=True`.
+            Rows index body-fixed frame axes, columns index internal coordinates.
+        grot : numpy.ndarray, shape (3, 3), dtype=object
+            Rotational G-matrix block, returned if `return_rot=True`.
+            The three blocks are returned as `(gvib, grovib, grot)` when `return_svec=False`.
+        aux : dict
+            Included only if `return_svec=True`.
+            With rotations the return value is `(gvib, grovib, grot, aux)`.
+            The dictionary contains Cartesian SOP coordinates `xyz` of shape (N, 3)
+            and vibrational derivatives `svib` of shape (M, N, 3), where N is the number of atoms.
+            With rotations included, it also contains `xyz_com`, `com`, `srot`, `cvec`, `cvec_raw`,
+            `tvec`, `J`, `Jinv`, `detJ`, and `frame_conditions`.
+
+        See Also
+        --------
+        Gmat,
+        Gmat.build_pseudopotential_fdf
+        """
+        start = perf_counter()
+
+        aux = self.build_svec(return_rot=return_rot)
+
+        if not return_rot:
+            gvib = self.build_gvib(aux["svib"])
+
+            print(
+                "G-matrix total (including geometry and s-vectors): "
+                f"{perf_counter() - start:.3f} s",
+                flush=True,
             )
 
-        return gvv, grv, grr
+            return (gvib, aux) if return_svec else gvib
+
+        blocks = self.build_full_g(aux["svib"], aux["srot"])
+
+        print(
+            "G-matrix total (including geometry and s-vectors): "
+            f"{perf_counter() - start:.3f} s",
+            flush=True,
+        )
+
+        return (*blocks, aux) if return_svec else blocks
