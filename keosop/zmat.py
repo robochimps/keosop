@@ -49,6 +49,44 @@ def _put_plane(planes, a, b, c, n):
 
 
 def internal_to_cartesian(zmat_connections, internal, pm=1):
+    """Computes Cartesian coordinates form Z-matrix internal coordinates.
+
+    Parameters
+    ----------
+    zmat_connections : sequence of tuples of int, shape (N, 4)
+        One row `(p1, p2, p3, J)` per atom in construction order.
+        References are one-based indices of previously placed atoms,
+        using the standard Z-matrix convention.
+    internal : sequence of scalars or keosop.sumprod.SumProd, shape (M,)
+        Coordinates grouped as all N-1 bond lengths, then N-2 bond angles,
+        then N-3 torsions or second bond angles, in increasing atom order
+        within each group.
+        All angles are in radians and bond lengths in Angstrom.
+        SumProd inputs preserve the SOP representation during construction.
+    pm : {1, -1}, default=1
+        Orientation of the third atom's transverse basis vector, `(pm, 0, 0)`.
+        The first atom is at the origin, the second on the positive z axis,
+        and the third in the xz plane.
+
+    Returns
+    -------
+    xyz : numpy.ndarray, shape (N, 3), dtype=object
+        Cartesian coordinates in the input atom order, with columns x, y, z.
+        Components are numerical scalars for numerical inputs, or SOP objects
+        and numerical constants for SumProd inputs.
+        Coordinates are not shifted to the center of mass.
+
+    Notes
+    -----
+    The implementation reuses previously constructed unit bond vectors and oriented plane normals. Referencing arbitrary earlier atoms is therefore not sufficient: the requested bond and plane must already exist in those frames.
+
+    See Also
+    --------
+    cartesian_to_internal,
+    keosop.gmat.Gmat,
+    keosop.gmat.run,
+    keosop.gmat.build_pseudopotential_fdf
+    """
     if pm not in (-1, 1):
         raise ValueError("pm must be +1 or -1")
 
@@ -172,6 +210,49 @@ def internal_to_cartesian(zmat_connections, internal, pm=1):
 
 
 def cartesian_to_internal(zmat_connections, xyz):
+    """Traces Z-matrix internal coordinates from Cartesian expression variables.
+
+    Parameters
+    ----------
+    zmat_connections : sequence of tuples of int, shape (N, 4)
+        One row `(p1, p2, p3, J)` per atom in construction order.
+        References are one-based indices of previously placed atoms,
+        using the standard Z-matrix convention.
+    xyz : array_like of keosop.revad.Expr, shape (N, 3)
+        Cartesian expression variables with columns ordered as x, y, z.
+        The geometry primitives require Expr components,
+        an ordinary array of floating-point coordinates is not accepted
+        for tracing bonds or angles.
+
+    Returns
+    -------
+    internal : numpy.ndarray of keosop.revad.Expr, shape (M,), dtype=object
+        Bond-length expressions for atoms 2 through N, followed by bond-angle
+        expressions for atoms 3 through N, then the third angular coordinates
+        for atoms 4 through N.
+        Angular expressions use radians, bond lengths use Angstrom.
+
+    Notes
+    -----
+    This function constructs an expression graph for reverse-mode automatic differentiation,
+    it does not numerically evaluate the coordinates.
+    It uses the atomic `distance`, `angle`, and `dihedral` primitives from `keosop.revad`
+    so Gmat can bind internal-coordinate expressions directly to the corresponding grids.
+
+    The coordinate order matches `internal_to_cartesian`.
+    Torsions follow the negative-dihedral sign convention and agree with the forward map
+    up to the periodic angular branch.
+
+    See Also
+    --------
+    internal_to_cartesian,
+    keosop.revad.distance,
+    keosop.revad.angle,
+    keosop.revad.dihedral
+    keosop.gmat.Gmat,
+    keosop.gmat.run,
+    keosop.gmat.build_pseudopotential_fdf
+    """
     xyz = np.asarray(xyz, dtype=object)
 
     natoms = len(zmat_connections)
